@@ -138,8 +138,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
 }
 
 bool llama_memory_hybrid_iswa::get_can_shift() const {
-    // Shifting is trivially supported for recurrent
-    return mem_attn->get_can_shift();
+    // Recurrent state cannot be shifted — shifting KV cache without
+    // recomputing recurrent state causes desynchronization.
+    return false;
 }
 
 void llama_memory_hybrid_iswa::clear(bool data) {
