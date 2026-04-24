@@ -1,0 +1,19 @@
+[Unit]
+Description=llama.cpp Model Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llama
+Group=llama
+WorkingDirectory=/path/to/llama.cpp/orchestrator
+ExecStart=/path/to/llama.cpp/orchestrator/venv/bin/python3 /path/to/llama.cpp/orchestrator/orchestrator.py /path/to/llama.cpp/orchestrator/config.yaml
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
