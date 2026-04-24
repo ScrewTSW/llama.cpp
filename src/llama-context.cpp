@@ -118,6 +118,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.n_gpu_layers_kv         = params.n_gpu_layers_kv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -3540,6 +3541,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.n_gpu_layers_kv             =*/ -1,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

@@ -2409,6 +2409,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"-nglkv", "--n-gpu-layers-kv"}, "N",
+        string_format("number of KV cache layers to offload to GPU (default: %d, -1 = follow --kv-offload)", params.n_gpu_layers_kv),
+        [](common_params & params, int value) {
+            params.n_gpu_layers_kv = value;
+        }
+    ).set_env("LLAMA_ARG_N_GPU_LAYERS_KV"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

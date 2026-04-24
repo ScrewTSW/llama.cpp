@@ -36,6 +36,7 @@ public:
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
+                  int32_t   n_gpu_layers_kv,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,

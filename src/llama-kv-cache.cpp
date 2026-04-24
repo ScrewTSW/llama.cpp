@@ -68,6 +68,7 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   offload,
+                  int32_t   n_gpu_layers_kv,
                      bool   unified,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
@@ -211,7 +212,11 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        const bool offload_this_layer = (n_gpu_layers_kv >= 0)
+            ? ((int32_t)layers.size() < n_gpu_layers_kv)
+            : offload;
+
+        if (offload_this_layer) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
