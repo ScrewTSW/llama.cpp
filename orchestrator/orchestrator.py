@@ -143,7 +143,7 @@ class ModelInstance:
         "model_path", "alias", "port", "process",
         "last_activity", "loading", "load_event", "n_slots",
         "last_save_time", "ctx_size", "default_max_tokens",
-        "active_requests", "is_hybrid",
+        "active_requests", "is_hybrid", "cached_system_prompt",
     )
 
     def __init__(self, model_path: Path, alias: str, port: int, n_slots: int = 1,
@@ -161,6 +161,7 @@ class ModelInstance:
         self.load_event: asyncio.Event = asyncio.Event()
         self.active_requests: int = 0
         self.is_hybrid: bool = False
+        self.cached_system_prompt: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -210,6 +211,9 @@ class Orchestrator:
         self._model_cache_time: float = 0
         self._session: aiohttp.ClientSession | None = None
         self._reaper_task: asyncio.Task | None = None
+        self._gpu_monitor_task: asyncio.Task | None = None
+        self._gpu_stats: dict = {}
+        self._slot_cache: dict = {}
 
     def _scan_models(self) -> dict[str, Path]:
         now = time.monotonic()
@@ -285,18 +289,41 @@ class Orchestrator:
         max_model_ctx = info.context_length or 262144
         per_layer_mb = model_size_mb / info.block_count
 
+        # Compute graph buffers (intermediate activations) need VRAM on top of
+        # model weights.  Estimate ~12% of the on-GPU weight size, with a floor
+        # of 384 MB for small models.
+        def _compute_buffer_mb(weights_mb: float) -> float:
+            return max(384.0, weights_mb * 0.10)
+
         if configured_ngl != -1:
             actual_layers = min(configured_ngl, info.block_count)
             weights_gpu_mb = actual_layers * per_layer_mb
+            compute_mb = _compute_buffer_mb(weights_gpu_mb)
+
+            if weights_gpu_mb + compute_mb > available_mb and actual_layers > 0:
+                clamped = actual_layers
+                while clamped > 0:
+                    w = clamped * per_layer_mb
+                    if w + _compute_buffer_mb(w) <= available_mb:
+                        break
+                    clamped -= 1
+                log.warning("Model %s: ngl %d needs %.0f MB (%.0f weights + %.0f compute) "
+                            "but only %.0f MB available — clamping to %d layers",
+                            model_path.name, configured_ngl,
+                            weights_gpu_mb + compute_mb, weights_gpu_mb, compute_mb,
+                            available_mb, clamped)
+                actual_layers = clamped
+                weights_gpu_mb = actual_layers * per_layer_mb
+
             is_partial = actual_layers < info.block_count
             kv_to_ram = is_partial or kv_location == "ram"
 
             if kv_to_ram:
                 ctx = configured_ctx if configured_ctx > 0 else min(131072, max_model_ctx)
             else:
-                free_for_kv = available_mb - weights_gpu_mb
+                free_for_kv = available_mb - weights_gpu_mb - _compute_buffer_mb(weights_gpu_mb)
                 if free_for_kv <= 0:
-                    return {"ngl": configured_ngl, "ctx_size": configured_ctx or 2048,
+                    return {"ngl": actual_layers, "ctx_size": configured_ctx or 2048,
                             "kv_mb": 0, "weights_on_gpu_mb": weights_gpu_mb}
                 kv_per_token_mb = info.kv_cache_mb(1, ctk, ctv)
                 if configured_ctx > 0:
@@ -305,7 +332,7 @@ class Orchestrator:
                     ctx = min(int(free_for_kv / kv_per_token_mb), max_model_ctx) if kv_per_token_mb > 0 else 8192
             ctx = min(ctx, max_model_ctx)
             kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
-            result = {"ngl": configured_ngl, "ctx_size": ctx, "kv_mb": kv_mb, "weights_on_gpu_mb": weights_gpu_mb}
+            result = {"ngl": actual_layers, "ctx_size": ctx, "kv_mb": kv_mb, "weights_on_gpu_mb": weights_gpu_mb}
             if kv_to_ram:
                 result["kv_in_ram"] = True
             return result
@@ -315,18 +342,19 @@ class Orchestrator:
         if kv_per_token_mb <= 0:
             return {"ngl": -1, "ctx_size": configured_ctx or 8192, "kv_mb": 0, "weights_on_gpu_mb": model_size_mb}
 
-        free_after_weights = available_mb - model_size_mb
+        compute_full_mb = _compute_buffer_mb(model_size_mb)
+        free_after_weights = available_mb - model_size_mb - compute_full_mb
         if free_after_weights > 0:
             if kv_location == "ram":
                 ctx = configured_ctx if configured_ctx > 0 else max_model_ctx
                 ctx = min(ctx, max_model_ctx)
                 kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
 
-                if model_size_mb + kv_mb <= available_mb:
+                if model_size_mb + kv_mb + compute_full_mb <= available_mb:
                     log.warning("Model %s: kv_location=ram requested but weights (%.0f MB) + KV at full %dk ctx "
-                                "(%.0f MB) = %.0f MB fits in %.0f MB VRAM — keeping KV in VRAM for faster inference",
-                                model_path.name, model_size_mb, ctx // 1024, kv_mb,
-                                model_size_mb + kv_mb, available_mb + safety_mb)
+                                "(%.0f MB) + compute (%.0f MB) = %.0f MB fits in %.0f MB VRAM — keeping KV in VRAM",
+                                model_path.name, model_size_mb, ctx // 1024, kv_mb, compute_full_mb,
+                                model_size_mb + kv_mb + compute_full_mb, available_mb + safety_mb)
                     return {"ngl": -1, "ctx_size": ctx, "kv_mb": kv_mb, "weights_on_gpu_mb": model_size_mb}
 
                 # Config override for n_gpu_layers_kv
@@ -362,20 +390,28 @@ class Orchestrator:
             if configured_ctx > 0:
                 ctx = min(configured_ctx, max_model_ctx)
                 kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
-                if model_size_mb + kv_mb > available_mb:
+                if model_size_mb + kv_mb + compute_full_mb > available_mb:
                     ctx = min(int(free_after_weights / kv_per_token_mb), max_model_ctx)
                     kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
             else:
                 ctx = min(int(free_after_weights / kv_per_token_mb), max_model_ctx)
                 kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
-            log.info("Model %s full offload: %d layers, %dk ctx (%.0f MB weights + %.0f MB KV = %.0f / %.0f MB)",
+            log.info("Model %s full offload: %d layers, %dk ctx (%.0f MB weights + %.0f MB KV + "
+                     "%.0f MB compute = %.0f / %.0f MB)",
                      model_path.name, info.block_count, ctx // 1024,
-                     model_size_mb, kv_mb, model_size_mb + kv_mb, available_mb + safety_mb)
+                     model_size_mb, kv_mb, compute_full_mb,
+                     model_size_mb + kv_mb + compute_full_mb, available_mb + safety_mb)
             return {"ngl": -1, "ctx_size": ctx, "kv_mb": kv_mb, "weights_on_gpu_mb": model_size_mb}
 
         # Partial offload — KV cache goes to system RAM (--no-kv-offload),
-        # so all GPU VRAM is available for model weight layers
-        max_layers = max(0, min(int(available_mb / per_layer_mb), info.block_count))
+        # so GPU VRAM is used for model weight layers + compute buffers
+        def _max_layers_with_compute(avail: float, ppl: float, blk: int) -> int:
+            for n in range(blk, -1, -1):
+                w = n * ppl
+                if w + _compute_buffer_mb(w) <= avail:
+                    return n
+            return 0
+        max_layers = _max_layers_with_compute(available_mb, per_layer_mb, info.block_count)
         weights_gpu_mb = max_layers * per_layer_mb
 
         if configured_ctx > 0:
@@ -409,6 +445,7 @@ class Orchestrator:
 
         parallel = 1 if is_hybrid else cfg.get("parallel", 1)
 
+        threads = cfg.get("threads", 4 if not is_partial else 0)
         cmd = [
             self.llama_bin,
             "--model", str(instance.model_path),
@@ -416,8 +453,11 @@ class Orchestrator:
             "--host", "127.0.0.1",
             "--ctx-size", str(ctx_size),
             "--parallel", str(parallel),
-            "--n-gpu-layers", str(ngl),
+            "--n-gpu-layers", str(info.block_count if ngl == -1 and info else ngl),
         ]
+        if threads > 0:
+            cmd.extend(["--threads", str(threads)])
+        cmd.extend(["--fit-target", "256"])
         cmd.extend(["--slot-save-path", str(kv_path)])
         if cfg.get("flash_attn", True):
             cmd.extend(["--flash-attn", "on"])
@@ -440,6 +480,9 @@ class Orchestrator:
             cmd.append("--context-shift")
         if cfg.get("embeddings", False):
             cmd.append("--embeddings")
+        reasoning_format = cfg.get("reasoning_format")
+        if reasoning_format:
+            cmd.extend(["--reasoning-format", reasoning_format])
 
         instance.is_hybrid = is_hybrid
         return cmd
@@ -479,13 +522,13 @@ class Orchestrator:
         async with self._lock:
             if alias in self.instances:
                 inst = self.instances[alias]
-                if inst.alive:
-                    inst.last_activity = time.monotonic()
-                    log.debug("Model %s already loaded (warm hit)", alias)
-                    return inst
                 if inst.loading:
                     log.info("Model %s is loading, waiting...", alias)
                     pending = inst
+                elif inst.alive:
+                    inst.last_activity = time.monotonic()
+                    log.debug("Model %s already loaded (warm hit)", alias)
+                    return inst
 
         if pending is not None:
             await pending.load_event.wait()
@@ -534,12 +577,28 @@ class Orchestrator:
 
             healthy = await self._wait_for_health(instance)
             if not healthy:
+                fail_reason = f"Model {alias} failed health check"
+                log_path = log_dir / "server.log"
+                try:
+                    server_log.flush()
+                    tail = log_path.read_text(errors="replace").strip().splitlines()
+                    error_lines = [ln for ln in tail if any(
+                        kw in ln.lower() for kw in ("failed", "error", "out of memory", "cudamalloc", "abort")
+                    )]
+                    if error_lines:
+                        detail = "; ".join(error_lines[-3:])
+                        fail_reason = f"Model {alias} failed to start: {detail}"
+                        log.error("Model %s server log errors:\n  %s", alias, "\n  ".join(error_lines))
+                    else:
+                        log.error("Model %s health check timed out (no errors in server log)", alias)
+                except Exception as e:
+                    log.warning("Could not read server log for %s: %s", alias, e)
                 if instance.process and instance.process.poll() is None:
                     instance.process.terminate()
                     instance.process.wait(timeout=10)
                 async with self._lock:
                     self.instances.pop(alias, None)
-                raise web.HTTPServiceUnavailable(text=f"Model {alias} failed health check")
+                raise web.HTTPServiceUnavailable(text=fail_reason)
 
             if not instance.is_hybrid:
                 await self._restore_kv_cache(instance)
@@ -623,11 +682,24 @@ class Orchestrator:
                         restored_any = True
                     else:
                         body = await resp.text()
-                        log.warning("KV cache restore failed for %s slot %d: HTTP %d: %s",
-                                    instance.alias, slot_id, resp.status, body[:200])
+                        log.warning("KV cache restore failed for %s slot %d: HTTP %d — deleting stale file",
+                                    instance.alias, slot_id, resp.status)
+                        save_file.unlink(missing_ok=True)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning("KV cache restore failed for %s slot %d: %s", instance.alias, slot_id, e)
+                log.warning("KV cache restore failed for %s slot %d: %s — deleting stale file",
+                            instance.alias, slot_id, e)
+                save_file.unlink(missing_ok=True)
         return restored_any
+
+    def _cleanup_kv_cache(self, alias: str):
+        """Remove all KV cache files for a model."""
+        kv_path = self.kv_cache_dir / alias
+        if kv_path.exists():
+            for f in kv_path.glob("*.bin"):
+                f.unlink()
+                log.info("Deleted stale KV cache: %s", f)
+            if not any(kv_path.iterdir()):
+                kv_path.rmdir()
 
     async def _unload_model(self, alias: str):
         inst = self.instances.pop(alias, None)
@@ -647,7 +719,8 @@ class Orchestrator:
             except subprocess.TimeoutExpired:
                 inst.process.kill()
                 inst.process.wait(timeout=5)
-            log.info("Model %s unloaded", alias)
+            log.info("Model %s unloaded, waiting for VRAM release", alias)
+            await asyncio.sleep(3)
 
     async def _reaper_loop(self):
         while True:
@@ -659,9 +732,13 @@ class Orchestrator:
                     to_unload.append(alias)
                 elif inst.active_requests > 0:
                     continue
-                elif (now - inst.last_activity) > self.idle_timeout:
-                    log.info("Model %s idle for %ds, scheduling unload", alias, int(now - inst.last_activity))
-                    to_unload.append(alias)
+                else:
+                    model_timeout = self._get_model_config(alias).get("idle_timeout", self.idle_timeout)
+                    idle_secs = now - inst.last_activity
+                    if idle_secs > model_timeout:
+                        log.info("Model %s idle for %ds (timeout %ds), scheduling unload",
+                                 alias, int(idle_secs), model_timeout)
+                        to_unload.append(alias)
             for alias in to_unload:
                 await self._unload_model(alias)
 
@@ -674,7 +751,85 @@ class Orchestrator:
                         return data["model"]
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
-        return request.query.get("model")
+        if model := request.query.get("model"):
+            return model
+        # Native llama.cpp endpoints (e.g. /completion, /props) don't carry
+        # a model field.  Fall back to the single loaded model if there is
+        # exactly one, or the configured default_model.
+        if len(self.instances) == 1:
+            return next(iter(self.instances))
+        return self.cfg.get("default_model")
+
+    @staticmethod
+    def _stabilize_system_prompt(instance: 'ModelInstance', msgs: list[dict]) -> bool:
+        """Keep the system prompt identical across turns to maximize KV cache prefix reuse.
+
+        Frontends like SillyTavern dynamically truncate the system message (character
+        card, world info) to fit the context budget.  This breaks the byte-exact prefix
+        match that --cache-reuse relies on.  We cache the longest system message seen
+        and restore it on subsequent requests so the tokenized prefix stays stable.
+        """
+        if not msgs or msgs[0].get("role") != "system":
+            return False
+        content = msgs[0].get("content", "")
+        cached = instance.cached_system_prompt
+        if cached is None or len(content) > len(cached):
+            instance.cached_system_prompt = content
+            if cached is not None:
+                log.info("System prompt grew from %d to %d chars for %s, updating cache",
+                         len(cached), len(content), instance.alias)
+            return False
+        if content == cached:
+            return False
+        if cached.startswith(content[:min(100, len(content))]):
+            msgs[0]["content"] = cached
+            log.debug("Restored system prompt (%d -> %d chars) for %s",
+                      len(content), len(cached), instance.alias)
+            return True
+        instance.cached_system_prompt = content
+        log.info("System prompt changed for %s (no prefix match), resetting cache", instance.alias)
+        return False
+
+    @staticmethod
+    def _enforce_alternation(msgs: list[dict]) -> bool:
+        """Force strict user/assistant alternation for templates that require it.
+
+        Handles two problems SillyTavern creates via Chat Completion API:
+        1. Consecutive same-role messages (world info, author's notes)
+        2. Assistant greeting right after system — Mistral-family templates
+           (Lumimaid, etc.) expect user at index 0 of non-system messages.
+           Mirrors what SillyTavern's Text Completion presets do with
+           first_output_sequence (injecting a synthetic [INST] user turn).
+        """
+        changed = False
+        original_count = len(msgs)
+
+        # Step 1: merge consecutive same-role messages first
+        merged = []
+        for msg in msgs:
+            if merged and msg.get("role") == merged[-1].get("role"):
+                prev_content = merged[-1].get("content", "")
+                new_content = msg.get("content", "")
+                merged[-1]["content"] = prev_content + "\n" + new_content
+            else:
+                merged.append(dict(msg))
+        if len(merged) < original_count:
+            msgs[:] = merged
+            log.info("Merged %d messages down to %d to fix role alternation",
+                     original_count, len(merged))
+            changed = True
+
+        # Step 2: if first non-system message is assistant, insert a
+        # synthetic user turn so the template sees user/assistant alternation
+        start = 0
+        if msgs and msgs[0].get("role") == "system":
+            start = 1
+        if start < len(msgs) and msgs[start].get("role") == "assistant":
+            msgs.insert(start, {"role": "user", "content": "[Start a new chat]"})
+            log.info("Inserted synthetic user turn before assistant greeting at index %d", start)
+            changed = True
+
+        return changed
 
     @staticmethod
     def _resolve_max_tokens(ctx_size: int, val: str | int | None) -> int | None:
@@ -702,7 +857,230 @@ class Orchestrator:
                 pass
         return ctx_size // 4
 
-    async def _proxy_request(self, request: web.Request, instance: ModelInstance) -> web.StreamResponse:
+    def _init_nvml(self) -> bool:
+        import ctypes
+        try:
+            self._nvml = ctypes.CDLL("libnvidia-ml.so.1")
+            if self._nvml.nvmlInit_v2() != 0:
+                return False
+            handle = ctypes.c_void_p()
+            if self._nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)) != 0:
+                return False
+            self._nvml_handle = handle
+            log.info("GPU monitor: NVML (direct)")
+            return True
+        except (OSError, AttributeError):
+            return False
+
+    def _read_nvml(self) -> dict | None:
+        import ctypes
+        try:
+            class MemInfo(ctypes.Structure):
+                _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+            mem = MemInfo()
+            if self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handle, ctypes.byref(mem)) != 0:
+                return None
+            temp = ctypes.c_uint()
+            self._nvml.nvmlDeviceGetTemperature(self._nvml_handle, 0, ctypes.byref(temp))
+            class UtilInfo(ctypes.Structure):
+                _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+            util = UtilInfo()
+            self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle, ctypes.byref(util))
+            return {
+                "vram_used": int(mem.used // (1024 * 1024)),
+                "vram_total": int(mem.total // (1024 * 1024)),
+                "gpu_temp": int(temp.value),
+                "gpu_util": int(util.gpu),
+            }
+        except Exception:
+            return None
+
+    async def _gpu_monitor_loop(self):
+        import shutil
+        reader = None
+        cmd = None
+        parser = None
+        if self._init_nvml():
+            reader = self._read_nvml
+        elif shutil.which("rocm-smi"):
+            cmd = ["rocm-smi", "--showmeminfo", "vram", "--showtemp", "--showuse", "--csv"]
+            parser = self._parse_rocm_smi
+            log.info("GPU monitor: rocm-smi")
+        elif shutil.which("xpu-smi"):
+            cmd = ["xpu-smi", "stats", "-d", "0", "-j"]
+            parser = self._parse_xpu_smi
+            log.info("GPU monitor: xpu-smi")
+        else:
+            log.info("No GPU library found, GPU stats disabled")
+        while True:
+            has_activity = any(
+                inst.alive or inst.loading for inst in self.instances.values()
+            )
+            if has_activity:
+                try:
+                    stats = {}
+                    if reader:
+                        stats = reader() or {}
+                    elif cmd and parser:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        stdout, _ = await proc.communicate()
+                        if proc.returncode == 0 and stdout:
+                            stats = parser(stdout.decode()) or {}
+                    ram = self._parse_proc_meminfo()
+                    if ram:
+                        stats.update(ram)
+                    if stats:
+                        self._gpu_stats = stats
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+    @staticmethod
+    def _parse_rocm_smi(output: str) -> dict | None:
+        stats: dict = {}
+        for line in output.strip().splitlines():
+            low = line.lower()
+            if "vram total" in low:
+                try: stats["vram_total"] = int(float(line.split(",")[-1].strip()) / (1024 * 1024))
+                except (ValueError, IndexError): pass
+            elif "vram used" in low:
+                try: stats["vram_used"] = int(float(line.split(",")[-1].strip()) / (1024 * 1024))
+                except (ValueError, IndexError): pass
+            elif "temperature" in low and "edge" in low:
+                try: stats["gpu_temp"] = int(float(line.split(",")[-1].strip()))
+                except (ValueError, IndexError): pass
+            elif "gpu use" in low:
+                try: stats["gpu_util"] = int(float(line.split(",")[-1].strip().rstrip("%")))
+                except (ValueError, IndexError): pass
+        if "vram_used" in stats and "vram_total" in stats:
+            return stats
+        return None
+
+    @staticmethod
+    def _parse_xpu_smi(output: str) -> dict | None:
+        try:
+            data = json.loads(output)
+            dev = data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
+            if not dev:
+                return None
+            return {
+                "vram_used": int(dev.get("device_memory_used_size_MB", 0)),
+                "vram_total": int(dev.get("device_memory_total_size_MB", 0)),
+                "gpu_temp": int(dev.get("gpu_temperature_C", 0)),
+                "gpu_util": int(dev.get("gpu_utilization_%", 0)),
+            }
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    @staticmethod
+    def _parse_proc_meminfo() -> dict | None:
+        try:
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        info["ram_total"] = int(line.split()[1]) // 1024
+                    elif line.startswith("MemAvailable:"):
+                        info["ram_avail"] = int(line.split()[1]) // 1024
+                    if len(info) == 2:
+                        break
+            if "ram_total" in info and "ram_avail" in info:
+                info["ram_used"] = info["ram_total"] - info["ram_avail"]
+                return info
+        except Exception:
+            pass
+        return None
+
+    async def _slot_monitor_loop(self):
+        while True:
+            for inst in self.instances.values():
+                if inst.alive and inst.active_requests > 0:
+                    try:
+                        async with self._session.get(
+                            f"{inst.base_url}/slots",
+                            timeout=aiohttp.ClientTimeout(total=2),
+                        ) as resp:
+                            if resp.status == 200:
+                                slots = await resp.json()
+                                if slots:
+                                    s = slots[0]
+                                    self._slot_cache = {
+                                        "prompt": s.get("n_prompt_tokens_processed", 0) or 0,
+                                        "prompt_total": s.get("n_prompt_tokens", 0) or 0,
+                                        "predicted": s.get("n_decoded", 0) or 0,
+                                    }
+                    except Exception:
+                        pass
+                    break
+            else:
+                self._slot_cache = {}
+            await asyncio.sleep(2)
+
+    @staticmethod
+    async def _keepalive_loop(resp: web.StreamResponse, instance: 'ModelInstance | None' = None, interval: float = 2.0):
+        start = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                elapsed = time.monotonic() - start
+                progress = {
+                    "gen": 0, "think": 0, "prompt": 0,
+                    "elapsed": round(elapsed, 1), "tok_s": 0,
+                    "ctx_size": instance.ctx_size if instance else 0,
+                    "ctx_used": 0, "loading": True,
+                }
+                chunk = {"choices": [{"delta": {}}], "x_progress": progress}
+                await resp.write(("data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n").encode())
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
+
+    async def _prompt_eval_loop(self, resp: web.StreamResponse, instance: ModelInstance,
+                               est_prompt_tokens: int = 0, interval: float = 2.0):
+        start = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                elapsed = time.monotonic() - start
+                processed = 0
+                state = "prompt eval"
+                try:
+                    async with self._session.get(
+                        f"{instance.base_url}/slots",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as sr:
+                        if sr.status == 200:
+                            slots = await sr.json()
+                            if slots:
+                                s = slots[0]
+                                processed = s.get("n_prompt_tokens_processed", 0) or 0
+                                n_predicted = s.get("n_decoded", 0) or 0
+                                n_total = s.get("n_prompt_tokens", 0) or 0
+                                if n_total > 0:
+                                    est_prompt_tokens = n_total
+                                if n_predicted > 0:
+                                    state = "generating"
+                except Exception:
+                    pass
+                prompt_total = processed or est_prompt_tokens
+                progress = {
+                    "gen": 0, "think": 0,
+                    "prompt": processed, "prompt_total": prompt_total,
+                    "elapsed": round(elapsed, 1), "tok_s": 0,
+                    "ctx_size": instance.ctx_size or 0,
+                    "ctx_used": processed,
+                    "state": state,
+                }
+                progress.update(self._gpu_stats)
+                chunk = {"choices": [{"delta": {}}], "x_progress": progress}
+                await resp.write(("data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n").encode())
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
+
+    async def _proxy_request(self, request: web.Request, instance: ModelInstance,
+                             resp: web.StreamResponse | None = None,
+                             keepalive_task: asyncio.Task | None = None) -> web.StreamResponse:
         target_url = f"{instance.base_url}{request.path_qs}"
         body = await request.read()
         headers = dict(request.headers)
@@ -717,6 +1095,26 @@ class Orchestrator:
                 data = json.loads(body)
                 if isinstance(data, dict):
                     is_stream = data.get("stream", False)
+                    if "messages" in data:
+                        msgs = data["messages"]
+                        roles = [m.get("role", "?") for m in msgs]
+                        log.info("[%s] %s incoming roles: %s", request.remote, instance.alias, roles)
+                        modified = self._stabilize_system_prompt(instance, msgs) or modified
+                        if self._get_model_config(instance.alias).get("merge_roles", False):
+                            modified = self._enforce_alternation(msgs) or modified
+                            if modified:
+                                roles_after = [m.get("role", "?") for m in msgs]
+                                log.info("[%s] %s roles after merge: %s", request.remote, instance.alias, roles_after)
+                    stop_extra = self._get_model_config(instance.alias).get("stop")
+                    if stop_extra:
+                        existing = data.get("stop") or []
+                        if isinstance(existing, str):
+                            existing = [existing]
+                        for s in stop_extra:
+                            if s not in existing:
+                                existing.append(s)
+                        data["stop"] = existing
+                        modified = True
                     if "max_tokens" not in data and "max_completion_tokens" not in data and instance.ctx_size > 0:
                         cap = self._resolve_max_tokens(instance.ctx_size, instance.default_max_tokens)
                         if cap is not None:
@@ -728,7 +1126,8 @@ class Orchestrator:
             body = json.dumps(data).encode()
             headers.pop("Content-Length", None)
             headers.pop("content-length", None)
-            log.info("[%s] Injected max_tokens=%d for %s", request.remote, data["max_tokens"], instance.alias)
+            if "max_tokens" in data:
+                log.info("[%s] Injected max_tokens=%d for %s", request.remote, data["max_tokens"], instance.alias)
 
         proxy_start = time.monotonic()
         timeout = aiohttp.ClientTimeout(total=900, sock_read=600)
@@ -738,22 +1137,107 @@ class Orchestrator:
                 async with self._session.request(
                     request.method, target_url, headers=headers, data=body, timeout=timeout
                 ) as upstream:
-                    resp = web.StreamResponse(
-                        status=upstream.status,
-                        headers={k: v for k, v in upstream.headers.items() if k.lower() not in ("transfer-encoding", "content-length")},
-                    )
-                    resp.content_type = upstream.content_type
-                    await resp.prepare(request)
-                    async for chunk in upstream.content.iter_any():
-                        await resp.write(chunk)
-                        instance.last_activity = time.monotonic()
-                    await resp.write_eof()
-                    elapsed = time.monotonic() - proxy_start
-                    log.info("[%s] Streaming response complete for %s in %.1fs",
-                             request.remote, instance.alias, elapsed)
+                    if resp is None:
+                        resp = web.StreamResponse(
+                            status=upstream.status,
+                            headers={k: v for k, v in upstream.headers.items() if k.lower() not in ("transfer-encoding", "content-length")},
+                        )
+                        resp.content_type = upstream.content_type
+                        try:
+                            await resp.prepare(request)
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, Exception) as e:
+                            if "closing transport" in str(e).lower() or "reset" in str(e).lower():
+                                log.info("[%s] Client disconnected before streaming started for %s",
+                                         request.remote, instance.alias)
+                                return resp
+                            raise
+                    if upstream.status >= 400:
+                        if keepalive_task:
+                            keepalive_task.cancel()
+                        err_body = await upstream.read()
+                        try:
+                            await resp.write(b"data: " + err_body + b"\n\n")
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                            pass
+                        await resp.write_eof()
+                        return resp
+                    cancelled = False
+                    buf = b""
+                    gen_tokens = 0
+                    think_tokens = 0
+                    prompt_tokens = 0
+                    in_thinking = False
+                    ctx_size = instance.ctx_size or 0
+                    async for raw_chunk in upstream.content.iter_any():
+                        if keepalive_task:
+                            keepalive_task.cancel()
+                            keepalive_task = None
+                        buf += raw_chunk
+                        while b"\n\n" in buf:
+                            event, buf = buf.split(b"\n\n", 1)
+                            event += b"\n\n"
+                            if event.startswith(b"data: ") and not event.startswith(b"data: [DONE]"):
+                                try:
+                                    obj = json.loads(event[6:].strip())
+                                    delta = (obj.get("choices") or [{}])[0].get("delta", {})
+                                    if delta.get("content"):
+                                        gen_tokens += 1
+                                    if delta.get("reasoning_content") or delta.get("reasoning"):
+                                        think_tokens += 1
+                                        in_thinking = True
+                                    elif delta.get("content") and in_thinking:
+                                        in_thinking = False
+                                    usage = obj.get("usage")
+                                    if usage and usage.get("prompt_tokens"):
+                                        prompt_tokens = usage["prompt_tokens"]
+                                    sc = self._slot_cache
+                                    if sc.get("prompt") and not prompt_tokens:
+                                        prompt_tokens = sc["prompt"]
+                                    elapsed = time.monotonic() - proxy_start
+                                    total_out = gen_tokens + think_tokens
+                                    tok_s = total_out / elapsed if elapsed > 0.5 else 0
+                                    ctx_used = prompt_tokens + total_out
+                                    progress = {
+                                        "gen": gen_tokens,
+                                        "think": think_tokens,
+                                        "prompt": prompt_tokens,
+                                        "elapsed": round(elapsed, 1),
+                                        "tok_s": round(tok_s, 1),
+                                        "ctx_size": ctx_size,
+                                        "ctx_used": ctx_used,
+                                    }
+                                    progress.update(self._gpu_stats)
+                                    obj["x_progress"] = progress
+                                    event = b"data: " + json.dumps(obj, separators=(",", ":")).encode() + b"\n\n"
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    pass
+                            try:
+                                await resp.write(event)
+                            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                                cancelled = True
+                                break
+                            instance.last_activity = time.monotonic()
+                        if cancelled:
+                            break
+                    if buf and not cancelled:
+                        try:
+                            await resp.write(buf)
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                            cancelled = True
+                    if cancelled:
+                        elapsed = time.monotonic() - proxy_start
+                        log.info("[%s] Client cancelled streaming for %s after %.1fs",
+                                 request.remote, instance.alias, elapsed)
+                    else:
+                        await resp.write_eof()
+                        elapsed = time.monotonic() - proxy_start
+                        log.info("[%s] Streaming response complete for %s in %.1fs",
+                                 request.remote, instance.alias, elapsed)
                     asyncio.create_task(self._maybe_save_kv_cache(instance))
                     return resp
             else:
+                if keepalive_task:
+                    keepalive_task.cancel()
                 async with self._session.request(
                     request.method, target_url, headers=headers, data=body, timeout=timeout
                 ) as upstream:
@@ -769,6 +1253,8 @@ class Orchestrator:
                         body=resp_body,
                     )
         finally:
+            if keepalive_task:
+                keepalive_task.cancel()
             instance.active_requests -= 1
             instance.last_activity = time.monotonic()
 
@@ -870,7 +1356,9 @@ class Orchestrator:
         model_name = self._extract_model_name(request, body)
         if not model_name:
             return web.json_response(
-                {"error": {"message": "No 'model' field in request", "type": "invalid_request_error"}},
+                {"error": {"message": "No 'model' field in request and no default model configured. "
+                                      "Set 'default_model' in config or pass ?model=name",
+                           "type": "invalid_request_error"}},
                 status=400,
             )
 
@@ -884,8 +1372,64 @@ class Orchestrator:
         alias, path = result
         client = request.remote
         log.info("[%s] %s %s model=%s", client, request.method, request.path, alias)
-        instance = await self._load_model(alias, path)
-        return await self._proxy_request(request, instance)
+
+        is_stream = False
+        if body:
+            try:
+                is_stream = json.loads(body).get("stream", False)
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                pass
+
+        resp = None
+        keepalive_task = None
+        if is_stream:
+            resp = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            try:
+                await resp.prepare(request)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, Exception) as e:
+                if "closing transport" in str(e).lower() or "reset" in str(e).lower():
+                    log.info("[%s] Client disconnected before model load for %s", client, alias)
+                    return resp
+                raise
+            keepalive_task = asyncio.create_task(self._keepalive_loop(resp))
+
+        try:
+            instance = await self._load_model(alias, path)
+        except Exception:
+            if keepalive_task:
+                keepalive_task.cancel()
+            if resp is not None:
+                err = json.dumps({"error": {"message": f"Failed to load model '{alias}'", "type": "server_error"}})
+                try:
+                    await resp.write(f"data: {err}\n\n".encode())
+                    await resp.write_eof()
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    pass
+                return resp
+            raise
+
+        if keepalive_task:
+            keepalive_task.cancel()
+        prompt_eval_task = None
+        if is_stream and resp is not None:
+            prompt_chars = 0
+            if body:
+                try:
+                    msgs = json.loads(body).get("messages", [])
+                    for m in msgs:
+                        c = m.get("content", "")
+                        prompt_chars += len(c) if isinstance(c, str) else sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
+                except Exception:
+                    pass
+            est_tokens = max(prompt_chars // 4, 0)
+            prompt_eval_task = asyncio.create_task(
+                self._prompt_eval_loop(resp, instance, est_tokens)
+            )
+
+        return await self._proxy_request(request, instance, resp, prompt_eval_task)
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -895,14 +1439,17 @@ class Orchestrator:
     async def _on_startup(self, app: web.Application):
         self._session = aiohttp.ClientSession()
         self._reaper_task = asyncio.create_task(self._reaper_loop())
+        self._gpu_monitor_task = asyncio.create_task(self._gpu_monitor_loop())
+        self._slot_monitor_task = asyncio.create_task(self._slot_monitor_loop())
         log.info("Orchestrator started on %s:%d", self.host, self.port)
         log.info("Model directory: %s", self.model_dir)
         log.info("Idle timeout: %ds | Max loaded: %d", self.idle_timeout, self.max_loaded)
 
     async def _on_shutdown(self, app: web.Application):
         log.info("Shutting down orchestrator...")
-        if self._reaper_task:
-            self._reaper_task.cancel()
+        for task in (self._reaper_task, self._gpu_monitor_task, self._slot_monitor_task):
+            if task:
+                task.cancel()
         for alias in list(self.instances):
             await self._unload_model(alias)
         if self._session:
@@ -918,6 +1465,7 @@ class Orchestrator:
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/orchestrator/status", self.handle_status)
+
         app.router.add_post("/orchestrator/load", self.handle_load)
         app.router.add_post("/orchestrator/unload", self.handle_unload)
 
@@ -932,6 +1480,9 @@ class Orchestrator:
         app.router.add_route("*", "/models", self.handle_models)
         app.router.add_route("*", "/tokenize", self.handle_proxy)
         app.router.add_route("*", "/detokenize", self.handle_proxy)
+        app.router.add_route("*", "/props", self.handle_proxy)
+        app.router.add_route("*", "/slots", self.handle_proxy)
+        app.router.add_route("*", r"/slots/{slot_id:\d+}", self.handle_proxy)
 
         return app
 
@@ -963,6 +1514,11 @@ idle_timeout: 300
 
 # Maximum number of models loaded simultaneously (0 = unlimited)
 max_loaded_models: 1
+
+# Default model for requests that don't specify one (e.g. SillyTavern's
+# native /completion endpoint).  Uses the single loaded model when only
+# one is active; set this when max_loaded_models > 1.
+# default_model: "some-model"
 
 # Default max_tokens injected when client doesn't set one.
 # Accepts: integer (fixed), "ctx/N" (fraction of context), "none" (disabled)
@@ -1011,8 +1567,11 @@ defaults:
 #     ctx_size: 65536
 #     ngl: 20
 #     kv_location: ram
+#     idle_timeout: 1800  # 30 minutes (overrides global idle_timeout)
+#     threads: 4           # CPU threads (default: 4 for full offload)
 #     n_gpu_layers_kv: 16
 #     default_max_tokens: 8192
+#     merge_roles: true   # merge consecutive same-role messages (for strict templates)
 """
 
 
@@ -1043,7 +1602,7 @@ class ModelAnalyzer:
         self.available_mb = max(0, self.gpu_total_mb - self.overhead_mb - self.safety_mb)
         self.system_ram_mb = _detect_system_ram_mb() or 0
 
-    def analyze(self, model_path: Path) -> dict:
+    def analyze(self, model_path: Path, max_ctx_override: int | None = None) -> dict:
         info = _read_gguf_info(model_path)
         if info is None:
             print(f"Error: cannot read GGUF metadata from {model_path}")
@@ -1052,7 +1611,8 @@ class ModelAnalyzer:
         size_mb = model_path.stat().st_size / (1024 ** 2)
         ctk = self.defaults.get("cache_type_k", "f16")
         ctv = self.defaults.get("cache_type_v", "f16")
-        max_model_ctx = info.context_length or 262144
+        native_ctx = info.context_length or 262144
+        max_model_ctx = min(max_ctx_override, native_ctx) if max_ctx_override else native_ctx
         per_layer_mb = size_mb / info.block_count if info.block_count else 0
         kv_per_token_mb = info.kv_cache_mb(1, ctk, ctv)
 
@@ -1192,8 +1752,8 @@ class ModelAnalyzer:
                   f"{ctx_vram:>10} {ctx_ram:>10} {rec_ctx + kv_hint:>12}")
         print()
 
-    def print_info(self, model_path: Path):
-        a = self.analyze(model_path)
+    def print_info(self, model_path: Path, max_ctx_override: int | None = None):
+        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
         ctk, ctv = a["cache_type_k"], a["cache_type_v"]
 
         print(f"\n{'=' * 72}")
@@ -1249,31 +1809,55 @@ class ModelAnalyzer:
 
     @staticmethod
     def _update_model_overrides(config_path: str, stem: str, overrides: dict):
-        """Append or update model_overrides in config without destroying comments."""
+        """Append or update model_overrides in config without destroying comments.
+
+        Uses a two-pass approach: parse with PyYAML for correctness, then
+        splice into the raw lines to preserve comments and formatting.
+        """
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+
+        if cfg is None:
+            cfg = {}
+
+        mo = cfg.get("model_overrides")
+        if mo is None or not isinstance(mo, dict):
+            mo = {}
+        mo[stem] = overrides
+        cfg["model_overrides"] = mo
+
         with open(config_path) as f:
             lines = f.readlines()
 
         override_yaml = yaml.dump(
             {stem: overrides}, default_flow_style=False, sort_keys=False,
         ).rstrip("\n")
-        # indent by 2 for nesting under model_overrides
         override_block = "\n".join("  " + ln for ln in override_yaml.split("\n")) + "\n"
 
-        # Find existing model_overrides section
         mo_idx = None
         mo_commented = False
         for i, line in enumerate(lines):
             stripped = line.lstrip()
-            if stripped.startswith("model_overrides:"):
-                mo_idx = i
-                mo_commented = False
-                break
             if stripped.startswith("# model_overrides:"):
                 mo_idx = i
                 mo_commented = True
                 break
+            if stripped.startswith("model_overrides:"):
+                mo_idx = i
+                mo_commented = False
+                break
 
-        if mo_idx is not None and not mo_commented:
+        if mo_idx is None:
+            lines.append("\nmodel_overrides:\n")
+            lines.append(override_block)
+        elif mo_commented:
+            lines[mo_idx] = "model_overrides:\n"
+            lines.insert(mo_idx + 1, override_block)
+        else:
+            mo_line = lines[mo_idx].rstrip()
+            if mo_line != "model_overrides:":
+                lines[mo_idx] = "model_overrides:\n"
+
             stem_q = f'  "{stem}":'
             stem_nq = f"  {stem}:"
             entry_start = None
@@ -1296,19 +1880,15 @@ class ModelAnalyzer:
                 lines[entry_start:entry_end] = [override_block]
             else:
                 lines.insert(mo_idx + 1, override_block)
-        elif mo_idx is not None and mo_commented:
-            lines[mo_idx] = "model_overrides:\n"
-            lines.insert(mo_idx + 1, override_block)
-        else:
-            lines.append("\nmodel_overrides:\n")
-            lines.append(override_block)
 
         with open(config_path, "w") as f:
             f.writelines(lines)
 
-    def autoconf(self, model_path: Path, config_path: str):
+        yaml.safe_load(open(config_path))  # validate
+
+    def autoconf(self, model_path: Path, config_path: str, max_ctx_override: int | None = None):
         stem = model_path.stem
-        a = self.analyze(model_path)
+        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
         overrides = self.generate_overrides(a)
 
         if overrides:
@@ -1331,7 +1911,7 @@ class ModelAnalyzer:
         if overrides:
             print(f"\nConfig updated: {config_path}")
 
-    def register(self, model_path: Path, config_path: str):
+    def register(self, model_path: Path, config_path: str, max_ctx_override: int | None = None):
         model_path = model_path.resolve()
         if not model_path.exists():
             print(f"Error: file not found: {model_path}")
@@ -1353,7 +1933,7 @@ class ModelAnalyzer:
         if stem in (cfg.get("model_overrides") or {}):
             print(f"Model '{stem}' already registered in config. Updating overrides.")
 
-        a = self.analyze(model_path)
+        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
         overrides = self.generate_overrides(a)
 
         if overrides:
@@ -1392,8 +1972,10 @@ def main():
 examples:
   %(prog)s                                  Start the orchestrator server
   %(prog)s --info model.gguf                Print model info and VRAM analysis
+  %(prog)s --info model.gguf --ctx 32768    Analyze at specific context size
   %(prog)s --autoconf model.gguf            Add heuristic overrides to config
   %(prog)s --register /path/to/model.gguf   Register a new model
+  %(prog)s --register model.gguf --ctx 32768  Register with target context
 """,
     )
     parser.add_argument("config", nargs="?", default=default_config,
@@ -1404,6 +1986,8 @@ examples:
                         help="print model info (no arg = all models table, with arg = detailed single model)")
     group.add_argument("--autoconf", metavar="MODEL", help="append heuristic config overrides for a model")
     group.add_argument("--register", metavar="MODEL", help="register a new model and write config overrides")
+    parser.add_argument("--ctx", type=int, metavar="N",
+                        help="target context size (overrides auto-detection from GGUF metadata)")
 
     args = parser.parse_args()
 
@@ -1435,11 +2019,11 @@ examples:
             print(f"Resolved: {model_arg} -> {model_path}")
 
         if args.info:
-            analyzer.print_info(model_path)
+            analyzer.print_info(model_path, max_ctx_override=args.ctx)
         elif args.autoconf:
-            analyzer.autoconf(model_path, args.config)
+            analyzer.autoconf(model_path, args.config, max_ctx_override=args.ctx)
         elif args.register:
-            analyzer.register(model_path, args.config)
+            analyzer.register(model_path, args.config, max_ctx_override=args.ctx)
         return
 
     orchestrator = Orchestrator(args.config)

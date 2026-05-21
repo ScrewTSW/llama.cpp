@@ -133,26 +133,33 @@ model_overrides:
 
 ### Management
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/v1/models` | GET | List all available models (OpenAI-compatible) |
-| `/orchestrator/status` | GET | Show loaded models, PIDs, idle times |
-| `/orchestrator/load` | POST | Preload a model: `{"model": "name"}` |
-| `/orchestrator/unload` | POST | Unload a model: `{"model": "name"}` |
+| Route | Method | Handler | Purpose |
+|---|---|---|---|
+| `/health` | GET | `handle_health` | Orchestrator health check |
+| `/v1/models` | GET | `handle_models` | OpenAI model list |
+| `/models` | * | `handle_models` | llama.cpp model list |
+| `/orchestrator/status` | GET | `handle_status` | Loaded models, PIDs, idle times |
+| `/orchestrator/load` | POST | `handle_load` | Preload a model: `{"model": "name"}` |
+| `/orchestrator/unload` | POST | `handle_unload` | Unload a model: `{"model": "name"}` |
 
 ### Inference (proxied to llama-server)
 
-| Endpoint | Description |
-|----------|-------------|
-| `/v1/chat/completions` | OpenAI Chat Completions API |
-| `/v1/completions` | OpenAI Completions API |
-| `/v1/embeddings` | OpenAI Embeddings API |
-| `/v1/responses` | OpenAI Responses API |
-| `/v1/messages` | Anthropic Messages API |
-| `/v1/messages/count_tokens` | Anthropic token counting |
+| Route | Method | Handler | Purpose |
+|---|---|---|---|
+| `/v1/{path:.*}` | * | `handle_proxy` | OpenAI-compatible catch-all (`/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`, etc.) |
+| `/completion` | * | `handle_proxy` | llama.cpp native text completion |
+| `/chat/completions` | * | `handle_proxy` | Chat completion (non-`/v1` path) |
+| `/responses` | * | `handle_proxy` | OpenAI Responses API |
+| `/embedding` | * | `handle_proxy` | Embedding generation |
+| `/tokenize` | * | `handle_proxy` | Token counting |
+| `/detokenize` | * | `handle_proxy` | Token decoding |
+| `/props` | * | `handle_proxy` | Server properties (context size, samplers) |
+| `/slots` | * | `handle_proxy` | Slot state list |
+| `/slots/{slot_id}` | * | `handle_proxy` | Individual slot state |
 
 All inference endpoints auto-load the model specified in the `model` field of the request body. No explicit load/unload required -- clients just send requests as if talking to OpenAI.
+
+For native llama.cpp endpoints that don't carry a `model` field (e.g. `/completion`, `/props`), the orchestrator falls back to the currently loaded model (when exactly one is active), or the `default_model` configured in `config.yaml`.
 
 ### Model Name Resolution
 
@@ -286,6 +293,35 @@ http://<your-ip>:58108/v1
 ```
 
 **Embedding models:** Perplexica may request embedding models. Enable with `embeddings: true` in the model's config override. For search-focused use, consider using Perplexica's built-in transformer embeddings instead.
+
+---
+
+### SillyTavern
+
+SillyTavern supports two connection modes -- both work with the orchestrator.
+
+#### Option 1: Chat Completion (OpenAI-compatible)
+
+1. In SillyTavern, select **Chat Completion** as the API type
+2. Choose **Custom (OpenAI-compatible)** as the source
+3. Set **Custom Endpoint:** `http://localhost:58108/v1`
+4. Set **API Key:** `not-needed`
+5. The model dropdown auto-populates from `/v1/models` -- select your model
+
+This is the simplest setup. The orchestrator auto-loads the selected model on first request.
+
+#### Option 2: Text Completion (llama.cpp native)
+
+1. In SillyTavern, select **Text Completion** as the API type
+2. Choose **llama.cpp** as the source
+3. Set **Server URL:** `http://localhost:58108`
+4. SillyTavern auto-detects context size and available samplers via `/props`
+
+This mode gives access to more samplers (min_p, dry, xtc, nsigma) than Chat Completion mode.
+
+**Model resolution:** Native llama.cpp endpoints don't include a `model` field. The orchestrator auto-resolves to the currently loaded model when `max_loaded_models: 1`. For multi-model setups, set `default_model` in `config.yaml`.
+
+**Known quirk:** SillyTavern sends `"grammar": ""` (empty string) even when no grammar is configured. This is harmless but may override llama-server's `--grammar-file` default if set.
 
 ---
 
