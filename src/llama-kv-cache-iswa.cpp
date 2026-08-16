@@ -28,7 +28,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share) :
-    llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
+    llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, n_gpu_layers_kv, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share) {
 }
 
@@ -39,6 +39,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   offload,
+                  int32_t   n_gpu_layers_kv,
                      bool   swa_full,
                      bool   unified,
                  uint32_t   kv_size,

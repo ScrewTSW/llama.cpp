@@ -93,6 +93,7 @@ public:
                     ggml_type   type_v,
                          bool   v_trans,
                          bool   offload,
+                      int32_t   n_gpu_layers_kv,
                          bool   swa_full,
                          bool   unified,
                      uint32_t   kv_size,
