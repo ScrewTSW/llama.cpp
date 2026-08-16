@@ -10,7 +10,6 @@ and concurrent multi-model serving.
 import asyncio
 import json
 import logging
-import struct
 import subprocess
 import sys
 import time
@@ -20,156 +19,16 @@ import aiohttp
 from aiohttp import web
 import yaml
 
+from analyzer import GGUFModelInfo, read_gguf_info, detect_gpu_memory_mb, detect_system_ram_mb, ModelAnalyzer
+from cache import ModelInstance, KVCacheManager
+from router import setup_routes
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("orchestrator")
-
-
-class GGUFModelInfo:
-    __slots__ = ("block_count", "context_length", "head_count", "head_count_kv", "embedding_length",
-                 "architecture", "ssm_d_state")
-
-    def __init__(self):
-        self.block_count: int | None = None
-        self.context_length: int | None = None
-        self.head_count: int | None = None
-        self.head_count_kv: int | None = None
-        self.embedding_length: int | None = None
-        self.architecture: str | None = None
-        self.ssm_d_state: int | None = None
-
-    @property
-    def head_dim(self) -> int | None:
-        if self.embedding_length and self.head_count:
-            return self.embedding_length // self.head_count
-        return None
-
-    @property
-    def is_hybrid(self) -> bool:
-        return self.ssm_d_state is not None and self.ssm_d_state > 0
-
-    def kv_cache_mb(self, ctx_size: int, cache_type_k: str = "f16", cache_type_v: str = "f16") -> float:
-        """Estimate KV cache size in MB for a given context size and cache types."""
-        hd = self.head_dim
-        if not all((self.head_count_kv, hd, self.block_count)):
-            return 0
-        bpw = {"f32": 32, "f16": 16, "bf16": 16, "q8_0": 8, "q5_1": 5.5, "q5_0": 5,
-               "q4_1": 4.5, "q4_0": 4, "iq4_nl": 4}
-        k_bits = bpw.get(cache_type_k, 16)
-        v_bits = bpw.get(cache_type_v, 16)
-        k_bytes = self.head_count_kv * hd * (k_bits / 8) * self.block_count * ctx_size
-        v_bytes = self.head_count_kv * hd * (v_bits / 8) * self.block_count * ctx_size
-        return (k_bytes + v_bytes) / (1024 ** 2)
-
-
-def _read_gguf_info(path: Path) -> GGUFModelInfo | None:
-    info = GGUFModelInfo()
-    try:
-        with open(path, "rb") as f:
-            magic = f.read(4)
-            if magic != b"GGUF":
-                return None
-            _version = struct.unpack("<I", f.read(4))[0]
-            _tensor_count = struct.unpack("<Q", f.read(8))[0]
-            kv_count = struct.unpack("<Q", f.read(8))[0]
-
-            def read_string():
-                slen = struct.unpack("<Q", f.read(8))[0]
-                return f.read(slen).decode("utf-8", errors="replace")
-
-            def read_value(vtype):
-                if vtype == 0:    return struct.unpack("<B", f.read(1))[0]
-                elif vtype == 1:  return struct.unpack("<b", f.read(1))[0]
-                elif vtype == 2:  return struct.unpack("<H", f.read(2))[0]
-                elif vtype == 3:  return struct.unpack("<h", f.read(2))[0]
-                elif vtype == 4:  return struct.unpack("<I", f.read(4))[0]
-                elif vtype == 5:  return struct.unpack("<i", f.read(4))[0]
-                elif vtype == 6:  return struct.unpack("<f", f.read(4))[0]
-                elif vtype == 7:  return struct.unpack("<?", f.read(1))[0]
-                elif vtype == 8:  return read_string()
-                elif vtype == 9:
-                    arr_type = struct.unpack("<I", f.read(4))[0]
-                    arr_len = struct.unpack("<Q", f.read(8))[0]
-                    return [read_value(arr_type) for _ in range(arr_len)]
-                elif vtype == 10: return struct.unpack("<Q", f.read(8))[0]
-                elif vtype == 11: return struct.unpack("<q", f.read(8))[0]
-                elif vtype == 12: return struct.unpack("<d", f.read(8))[0]
-                else:
-                    return None
-
-            for _ in range(kv_count):
-                key = read_string()
-                vtype = struct.unpack("<I", f.read(4))[0]
-                val = read_value(vtype)
-                if key == "general.architecture":  info.architecture = val
-                elif "block_count" in key:     info.block_count = val
-                elif "context_length" in key: info.context_length = val
-                elif "head_count_kv" in key:  info.head_count_kv = val
-                elif "head_count" in key:     info.head_count = val
-                elif "embedding_length" in key: info.embedding_length = val
-                elif "ssm.state_size" in key: info.ssm_d_state = val
-    except Exception as e:
-        log.warning("Failed to read GGUF metadata from %s: %s", path, e)
-        return None
-    return info
-
-
-def _detect_system_ram_mb() -> float | None:
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / 1024  # kB -> MB
-    except Exception:
-        return None
-
-
-def _detect_gpu_memory_mb() -> float | None:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            text=True, timeout=5,
-        )
-        return float(out.strip().split("\n")[0])
-    except Exception:
-        return None
-
-
-class ModelInstance:
-    __slots__ = (
-        "model_path", "alias", "port", "process",
-        "last_activity", "loading", "load_event", "n_slots",
-        "last_save_time", "ctx_size", "default_max_tokens",
-        "active_requests", "is_hybrid", "cached_system_prompt",
-    )
-
-    def __init__(self, model_path: Path, alias: str, port: int, n_slots: int = 1,
-                 ctx_size: int = 0, default_max_tokens: str | int | None = None):
-        self.model_path = model_path
-        self.alias = alias
-        self.port = port
-        self.n_slots = n_slots
-        self.ctx_size = ctx_size
-        self.default_max_tokens = default_max_tokens
-        self.process: subprocess.Popen | None = None
-        self.last_activity: float = time.monotonic()
-        self.last_save_time: float = 0.0
-        self.loading = False
-        self.load_event: asyncio.Event = asyncio.Event()
-        self.active_requests: int = 0
-        self.is_hybrid: bool = False
-        self.cached_system_prompt: str | None = None
-
-    @property
-    def alive(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-    @property
-    def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
 
 
 class Orchestrator:
@@ -193,7 +52,7 @@ class Orchestrator:
 
         gpu_cfg = self.cfg.get("gpu", {})
         self.gpu_overhead_mb = gpu_cfg.get("overhead_mb", 1024)
-        detected_mb = _detect_gpu_memory_mb()
+        detected_mb = detect_gpu_memory_mb()
         configured_mb = gpu_cfg.get("total_mb")
         self.gpu_total_mb = configured_mb or detected_mb or 0
         if self.gpu_total_mb > 0:
@@ -210,6 +69,7 @@ class Orchestrator:
         self._model_cache: dict[str, Path] | None = None
         self._model_cache_time: float = 0
         self._session: aiohttp.ClientSession | None = None
+        self._kv: KVCacheManager | None = None
         self._reaper_task: asyncio.Task | None = None
         self._gpu_monitor_task: asyncio.Task | None = None
         self._gpu_stats: dict = {}
@@ -263,7 +123,7 @@ class Orchestrator:
     def _get_gguf_info(self, model_path: Path) -> GGUFModelInfo | None:
         key = str(model_path)
         if key not in self._gguf_cache:
-            self._gguf_cache[key] = _read_gguf_info(model_path)
+            self._gguf_cache[key] = read_gguf_info(model_path)
         return self._gguf_cache[key]
 
     def _calculate_vram_plan(self, model_path: Path, cfg: dict) -> dict:
@@ -445,7 +305,9 @@ class Orchestrator:
 
         parallel = 1 if is_hybrid else cfg.get("parallel", 1)
 
-        threads = cfg.get("threads", 4 if not is_partial else 0)
+        import os
+        max_threads = max(1, (os.cpu_count() or 4) - 2)
+        threads = cfg.get("threads", max_threads)
         cmd = [
             self.llama_bin,
             "--model", str(instance.model_path),
@@ -457,7 +319,9 @@ class Orchestrator:
         ]
         if threads > 0:
             cmd.extend(["--threads", str(threads)])
-        cmd.extend(["--fit-target", "256"])
+        fit_target = cfg.get("fit_target", 256)
+        if fit_target is not None and fit_target is not False:
+            cmd.extend(["--fit-target", str(fit_target)])
         cmd.extend(["--slot-save-path", str(kv_path)])
         if cfg.get("flash_attn", True):
             cmd.extend(["--flash-attn", "on"])
@@ -483,6 +347,29 @@ class Orchestrator:
         reasoning_format = cfg.get("reasoning_format")
         if reasoning_format:
             cmd.extend(["--reasoning-format", reasoning_format])
+        if cfg.get("jinja", False):
+            cmd.append("--jinja")
+        repeat_penalty = cfg.get("repeat_penalty")
+        if repeat_penalty is not None:
+            cmd.extend(["--repeat-penalty", str(repeat_penalty)])
+        frequency_penalty = cfg.get("frequency_penalty")
+        if frequency_penalty is not None:
+            cmd.extend(["--frequency-penalty", str(frequency_penalty)])
+        rope_freq_base = cfg.get("rope_freq_base")
+        if rope_freq_base is not None:
+            cmd.extend(["--rope-freq-base", str(rope_freq_base)])
+        rope_scaling = cfg.get("rope_scaling")
+        if rope_scaling is not None:
+            cmd.extend(["--rope-scaling", str(rope_scaling)])
+        rope_scale = cfg.get("rope_scale")
+        if rope_scale is not None:
+            cmd.extend(["--rope-scale", str(rope_scale)])
+        rope_freq_scale = cfg.get("rope_freq_scale")
+        if rope_freq_scale is not None:
+            cmd.extend(["--rope-freq-scale", str(rope_freq_scale)])
+        yarn_orig_ctx = cfg.get("yarn_orig_ctx")
+        if yarn_orig_ctx is not None:
+            cmd.extend(["--yarn-orig-ctx", str(yarn_orig_ctx)])
 
         instance.is_hybrid = is_hybrid
         return cmd
@@ -601,7 +488,7 @@ class Orchestrator:
                 raise web.HTTPServiceUnavailable(text=fail_reason)
 
             if not instance.is_hybrid:
-                await self._restore_kv_cache(instance)
+                await self._kv.restore(instance)
             instance.last_activity = time.monotonic()
             instance.loading = False
             instance.load_event.set()
@@ -617,90 +504,6 @@ class Orchestrator:
                 self.instances.pop(alias, None)
             raise
 
-    async def _save_kv_cache(self, instance: ModelInstance) -> bool:
-        """Save the KV cache for all slots to disk."""
-        if not instance.alive:
-            return False
-        saved_any = False
-        for slot_id in range(instance.n_slots):
-            url = f"{instance.base_url}/slots/{slot_id}?action=save"
-            filename = f"{instance.alias}_slot{slot_id}.bin"
-            try:
-                async with self._session.post(
-                    url,
-                    json={"filename": filename},
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        n_tokens = result.get("n_saved", 0)
-                        n_bytes = result.get("n_written", 0)
-                        if n_tokens > 0:
-                            log.info("KV cache saved for %s slot %d: %d tokens, %.1f MB",
-                                     instance.alias, slot_id, n_tokens, n_bytes / (1024 * 1024))
-                            saved_any = True
-                    else:
-                        body = await resp.text()
-                        log.warning("KV cache save failed for %s slot %d: HTTP %d: %s",
-                                    instance.alias, slot_id, resp.status, body[:200])
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning("KV cache save failed for %s slot %d: %s", instance.alias, slot_id, e)
-        return saved_any
-
-    async def _maybe_save_kv_cache(self, instance: ModelInstance):
-        """Save KV cache if enough time has passed since last save."""
-        now = time.monotonic()
-        if now - instance.last_save_time < 30:
-            return
-        instance.last_save_time = now
-        await self._save_kv_cache(instance)
-
-    async def _restore_kv_cache(self, instance: ModelInstance) -> bool:
-        """Restore KV cache for all slots from disk after loading."""
-        if not instance.alive:
-            return False
-        restored_any = False
-        for slot_id in range(instance.n_slots):
-            kv_path = self.kv_cache_dir / instance.alias
-            save_file = kv_path / f"{instance.alias}_slot{slot_id}.bin"
-            if not save_file.exists():
-                continue
-            url = f"{instance.base_url}/slots/{slot_id}?action=restore"
-            filename = f"{instance.alias}_slot{slot_id}.bin"
-            try:
-                async with self._session.post(
-                    url,
-                    json={"filename": filename},
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        n_tokens = result.get("n_restored", 0)
-                        n_bytes = result.get("n_read", 0)
-                        log.info("KV cache restored for %s slot %d: %d tokens, %.1f MB",
-                                 instance.alias, slot_id, n_tokens, n_bytes / (1024 * 1024))
-                        restored_any = True
-                    else:
-                        body = await resp.text()
-                        log.warning("KV cache restore failed for %s slot %d: HTTP %d — deleting stale file",
-                                    instance.alias, slot_id, resp.status)
-                        save_file.unlink(missing_ok=True)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning("KV cache restore failed for %s slot %d: %s — deleting stale file",
-                            instance.alias, slot_id, e)
-                save_file.unlink(missing_ok=True)
-        return restored_any
-
-    def _cleanup_kv_cache(self, alias: str):
-        """Remove all KV cache files for a model."""
-        kv_path = self.kv_cache_dir / alias
-        if kv_path.exists():
-            for f in kv_path.glob("*.bin"):
-                f.unlink()
-                log.info("Deleted stale KV cache: %s", f)
-            if not any(kv_path.iterdir()):
-                kv_path.rmdir()
-
     async def _unload_model(self, alias: str):
         inst = self.instances.pop(alias, None)
         if inst is None:
@@ -711,7 +514,7 @@ class Orchestrator:
                             alias, inst.active_requests)
             else:
                 log.info("Saving KV cache before unloading %s (pid %d)", alias, inst.process.pid)
-                await self._save_kv_cache(inst)
+                await self._kv.save(inst)
             log.info("Unloading model %s (pid %d)", alias, inst.process.pid)
             inst.process.terminate()
             try:
@@ -741,121 +544,6 @@ class Orchestrator:
                         to_unload.append(alias)
             for alias in to_unload:
                 await self._unload_model(alias)
-
-    def _extract_model_name(self, request: web.Request, body: bytes | None) -> str | None:
-        if body:
-            try:
-                data = json.loads(body)
-                if isinstance(data, dict):
-                    if "model" in data:
-                        return data["model"]
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-        if model := request.query.get("model"):
-            return model
-        # Native llama.cpp endpoints (e.g. /completion, /props) don't carry
-        # a model field.  Fall back to the single loaded model if there is
-        # exactly one, or the configured default_model.
-        if len(self.instances) == 1:
-            return next(iter(self.instances))
-        return self.cfg.get("default_model")
-
-    @staticmethod
-    def _stabilize_system_prompt(instance: 'ModelInstance', msgs: list[dict]) -> bool:
-        """Keep the system prompt identical across turns to maximize KV cache prefix reuse.
-
-        Frontends like SillyTavern dynamically truncate the system message (character
-        card, world info) to fit the context budget.  This breaks the byte-exact prefix
-        match that --cache-reuse relies on.  We cache the longest system message seen
-        and restore it on subsequent requests so the tokenized prefix stays stable.
-        """
-        if not msgs or msgs[0].get("role") != "system":
-            return False
-        content = msgs[0].get("content", "")
-        cached = instance.cached_system_prompt
-        if cached is None or len(content) > len(cached):
-            instance.cached_system_prompt = content
-            if cached is not None:
-                log.info("System prompt grew from %d to %d chars for %s, updating cache",
-                         len(cached), len(content), instance.alias)
-            return False
-        if content == cached:
-            return False
-        if cached.startswith(content[:min(100, len(content))]):
-            msgs[0]["content"] = cached
-            log.debug("Restored system prompt (%d -> %d chars) for %s",
-                      len(content), len(cached), instance.alias)
-            return True
-        instance.cached_system_prompt = content
-        log.info("System prompt changed for %s (no prefix match), resetting cache", instance.alias)
-        return False
-
-    @staticmethod
-    def _enforce_alternation(msgs: list[dict]) -> bool:
-        """Force strict user/assistant alternation for templates that require it.
-
-        Handles two problems SillyTavern creates via Chat Completion API:
-        1. Consecutive same-role messages (world info, author's notes)
-        2. Assistant greeting right after system — Mistral-family templates
-           (Lumimaid, etc.) expect user at index 0 of non-system messages.
-           Mirrors what SillyTavern's Text Completion presets do with
-           first_output_sequence (injecting a synthetic [INST] user turn).
-        """
-        changed = False
-        original_count = len(msgs)
-
-        # Step 1: merge consecutive same-role messages first
-        merged = []
-        for msg in msgs:
-            if merged and msg.get("role") == merged[-1].get("role"):
-                prev_content = merged[-1].get("content", "")
-                new_content = msg.get("content", "")
-                merged[-1]["content"] = prev_content + "\n" + new_content
-            else:
-                merged.append(dict(msg))
-        if len(merged) < original_count:
-            msgs[:] = merged
-            log.info("Merged %d messages down to %d to fix role alternation",
-                     original_count, len(merged))
-            changed = True
-
-        # Step 2: if first non-system message is assistant, insert a
-        # synthetic user turn so the template sees user/assistant alternation
-        start = 0
-        if msgs and msgs[0].get("role") == "system":
-            start = 1
-        if start < len(msgs) and msgs[start].get("role") == "assistant":
-            msgs.insert(start, {"role": "user", "content": "[Start a new chat]"})
-            log.info("Inserted synthetic user turn before assistant greeting at index %d", start)
-            changed = True
-
-        return changed
-
-    @staticmethod
-    def _resolve_max_tokens(ctx_size: int, val: str | int | None) -> int | None:
-        if val is None or val == "none" or val == 0:
-            return None
-        if isinstance(val, int):
-            return val
-        if isinstance(val, str):
-            val = val.strip().lower()
-            if val.startswith("ctx/"):
-                try:
-                    divisor = int(val[4:])
-                    return ctx_size // divisor if divisor > 0 else None
-                except ValueError:
-                    pass
-            elif val.startswith("ctx*"):
-                try:
-                    multiplier = float(val[4:])
-                    return int(ctx_size * multiplier)
-                except ValueError:
-                    pass
-            try:
-                return int(val)
-            except ValueError:
-                pass
-        return ctx_size // 4
 
     def _init_nvml(self) -> bool:
         import ctypes
@@ -931,6 +619,9 @@ class Orchestrator:
                     ram = self._parse_proc_meminfo()
                     if ram:
                         stats.update(ram)
+                    cpu = self._read_cpu_stats()
+                    if cpu:
+                        stats.update(cpu)
                     if stats:
                         self._gpu_stats = stats
                 except Exception:
@@ -993,6 +684,35 @@ class Orchestrator:
             pass
         return None
 
+    def _read_cpu_stats(self) -> dict:
+        stats = {}
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            if len(parts) >= 5:
+                idle = int(parts[4])
+                total = sum(int(x) for x in parts[1:])
+                prev = getattr(self, "_cpu_prev", None)
+                self._cpu_prev = (idle, total)
+                if prev:
+                    d_idle = idle - prev[0]
+                    d_total = total - prev[1]
+                    if d_total > 0:
+                        stats["cpu_util"] = round(100 * (1 - d_idle / d_total))
+        except Exception:
+            pass
+        try:
+            for hwmon in Path("/sys/class/hwmon").iterdir():
+                name = (hwmon / "name").read_text().strip()
+                if name in ("k10temp", "coretemp", "zenpower"):
+                    temp_file = hwmon / "temp1_input"
+                    if temp_file.exists():
+                        stats["cpu_temp"] = int(temp_file.read_text().strip()) // 1000
+                    break
+        except Exception:
+            pass
+        return stats
+
     async def _slot_monitor_loop(self):
         while True:
             for inst in self.instances.values():
@@ -1006,259 +726,19 @@ class Orchestrator:
                                 slots = await resp.json()
                                 if slots:
                                     s = slots[0]
-                                    self._slot_cache = {
-                                        "prompt": s.get("n_prompt_tokens_processed", 0) or 0,
-                                        "prompt_total": s.get("n_prompt_tokens", 0) or 0,
-                                        "predicted": s.get("n_decoded", 0) or 0,
-                                    }
+                                    for k, v in [
+                                        ("prompt", s.get("n_prompt_tokens_processed", 0) or 0),
+                                        ("prompt_total", s.get("n_prompt_tokens", 0) or 0),
+                                        ("predicted", s.get("n_decoded", 0) or 0),
+                                    ]:
+                                        if v > 0:
+                                            self._slot_cache[k] = max(self._slot_cache.get(k, 0), v)
                     except Exception:
                         pass
                     break
             else:
                 self._slot_cache = {}
             await asyncio.sleep(2)
-
-    @staticmethod
-    async def _keepalive_loop(resp: web.StreamResponse, instance: 'ModelInstance | None' = None, interval: float = 2.0):
-        start = time.monotonic()
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                elapsed = time.monotonic() - start
-                progress = {
-                    "gen": 0, "think": 0, "prompt": 0,
-                    "elapsed": round(elapsed, 1), "tok_s": 0,
-                    "ctx_size": instance.ctx_size if instance else 0,
-                    "ctx_used": 0, "loading": True,
-                }
-                chunk = {"choices": [{"delta": {}}], "x_progress": progress}
-                await resp.write(("data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n").encode())
-        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            pass
-
-    async def _prompt_eval_loop(self, resp: web.StreamResponse, instance: ModelInstance,
-                               est_prompt_tokens: int = 0, interval: float = 2.0):
-        start = time.monotonic()
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                elapsed = time.monotonic() - start
-                processed = 0
-                state = "prompt eval"
-                try:
-                    async with self._session.get(
-                        f"{instance.base_url}/slots",
-                        timeout=aiohttp.ClientTimeout(total=2),
-                    ) as sr:
-                        if sr.status == 200:
-                            slots = await sr.json()
-                            if slots:
-                                s = slots[0]
-                                processed = s.get("n_prompt_tokens_processed", 0) or 0
-                                n_predicted = s.get("n_decoded", 0) or 0
-                                n_total = s.get("n_prompt_tokens", 0) or 0
-                                if n_total > 0:
-                                    est_prompt_tokens = n_total
-                                if n_predicted > 0:
-                                    state = "generating"
-                except Exception:
-                    pass
-                prompt_total = processed or est_prompt_tokens
-                progress = {
-                    "gen": 0, "think": 0,
-                    "prompt": processed, "prompt_total": prompt_total,
-                    "elapsed": round(elapsed, 1), "tok_s": 0,
-                    "ctx_size": instance.ctx_size or 0,
-                    "ctx_used": processed,
-                    "state": state,
-                }
-                progress.update(self._gpu_stats)
-                chunk = {"choices": [{"delta": {}}], "x_progress": progress}
-                await resp.write(("data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n").encode())
-        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            pass
-
-    async def _proxy_request(self, request: web.Request, instance: ModelInstance,
-                             resp: web.StreamResponse | None = None,
-                             keepalive_task: asyncio.Task | None = None) -> web.StreamResponse:
-        target_url = f"{instance.base_url}{request.path_qs}"
-        body = await request.read()
-        headers = dict(request.headers)
-        headers.pop("Host", None)
-        instance.active_requests += 1
-        instance.last_activity = time.monotonic()
-
-        is_stream = False
-        modified = False
-        if body:
-            try:
-                data = json.loads(body)
-                if isinstance(data, dict):
-                    is_stream = data.get("stream", False)
-                    if "messages" in data:
-                        msgs = data["messages"]
-                        roles = [m.get("role", "?") for m in msgs]
-                        log.info("[%s] %s incoming roles: %s", request.remote, instance.alias, roles)
-                        modified = self._stabilize_system_prompt(instance, msgs) or modified
-                        if self._get_model_config(instance.alias).get("merge_roles", False):
-                            modified = self._enforce_alternation(msgs) or modified
-                            if modified:
-                                roles_after = [m.get("role", "?") for m in msgs]
-                                log.info("[%s] %s roles after merge: %s", request.remote, instance.alias, roles_after)
-                    stop_extra = self._get_model_config(instance.alias).get("stop")
-                    if stop_extra:
-                        existing = data.get("stop") or []
-                        if isinstance(existing, str):
-                            existing = [existing]
-                        for s in stop_extra:
-                            if s not in existing:
-                                existing.append(s)
-                        data["stop"] = existing
-                        modified = True
-                    if "max_tokens" not in data and "max_completion_tokens" not in data and instance.ctx_size > 0:
-                        cap = self._resolve_max_tokens(instance.ctx_size, instance.default_max_tokens)
-                        if cap is not None:
-                            data["max_tokens"] = cap
-                            modified = True
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-        if modified:
-            body = json.dumps(data).encode()
-            headers.pop("Content-Length", None)
-            headers.pop("content-length", None)
-            if "max_tokens" in data:
-                log.info("[%s] Injected max_tokens=%d for %s", request.remote, data["max_tokens"], instance.alias)
-
-        proxy_start = time.monotonic()
-        timeout = aiohttp.ClientTimeout(total=900, sock_read=600)
-
-        try:
-            if is_stream:
-                async with self._session.request(
-                    request.method, target_url, headers=headers, data=body, timeout=timeout
-                ) as upstream:
-                    if resp is None:
-                        resp = web.StreamResponse(
-                            status=upstream.status,
-                            headers={k: v for k, v in upstream.headers.items() if k.lower() not in ("transfer-encoding", "content-length")},
-                        )
-                        resp.content_type = upstream.content_type
-                        try:
-                            await resp.prepare(request)
-                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, Exception) as e:
-                            if "closing transport" in str(e).lower() or "reset" in str(e).lower():
-                                log.info("[%s] Client disconnected before streaming started for %s",
-                                         request.remote, instance.alias)
-                                return resp
-                            raise
-                    if upstream.status >= 400:
-                        if keepalive_task:
-                            keepalive_task.cancel()
-                        err_body = await upstream.read()
-                        try:
-                            await resp.write(b"data: " + err_body + b"\n\n")
-                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                            pass
-                        await resp.write_eof()
-                        return resp
-                    cancelled = False
-                    buf = b""
-                    gen_tokens = 0
-                    think_tokens = 0
-                    prompt_tokens = 0
-                    in_thinking = False
-                    ctx_size = instance.ctx_size or 0
-                    async for raw_chunk in upstream.content.iter_any():
-                        if keepalive_task:
-                            keepalive_task.cancel()
-                            keepalive_task = None
-                        buf += raw_chunk
-                        while b"\n\n" in buf:
-                            event, buf = buf.split(b"\n\n", 1)
-                            event += b"\n\n"
-                            if event.startswith(b"data: ") and not event.startswith(b"data: [DONE]"):
-                                try:
-                                    obj = json.loads(event[6:].strip())
-                                    delta = (obj.get("choices") or [{}])[0].get("delta", {})
-                                    if delta.get("content"):
-                                        gen_tokens += 1
-                                    if delta.get("reasoning_content") or delta.get("reasoning"):
-                                        think_tokens += 1
-                                        in_thinking = True
-                                    elif delta.get("content") and in_thinking:
-                                        in_thinking = False
-                                    usage = obj.get("usage")
-                                    if usage and usage.get("prompt_tokens"):
-                                        prompt_tokens = usage["prompt_tokens"]
-                                    sc = self._slot_cache
-                                    if sc.get("prompt") and not prompt_tokens:
-                                        prompt_tokens = sc["prompt"]
-                                    elapsed = time.monotonic() - proxy_start
-                                    total_out = gen_tokens + think_tokens
-                                    tok_s = total_out / elapsed if elapsed > 0.5 else 0
-                                    ctx_used = prompt_tokens + total_out
-                                    progress = {
-                                        "gen": gen_tokens,
-                                        "think": think_tokens,
-                                        "prompt": prompt_tokens,
-                                        "elapsed": round(elapsed, 1),
-                                        "tok_s": round(tok_s, 1),
-                                        "ctx_size": ctx_size,
-                                        "ctx_used": ctx_used,
-                                    }
-                                    progress.update(self._gpu_stats)
-                                    obj["x_progress"] = progress
-                                    event = b"data: " + json.dumps(obj, separators=(",", ":")).encode() + b"\n\n"
-                                except (json.JSONDecodeError, KeyError, IndexError):
-                                    pass
-                            try:
-                                await resp.write(event)
-                            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                                cancelled = True
-                                break
-                            instance.last_activity = time.monotonic()
-                        if cancelled:
-                            break
-                    if buf and not cancelled:
-                        try:
-                            await resp.write(buf)
-                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                            cancelled = True
-                    if cancelled:
-                        elapsed = time.monotonic() - proxy_start
-                        log.info("[%s] Client cancelled streaming for %s after %.1fs",
-                                 request.remote, instance.alias, elapsed)
-                    else:
-                        await resp.write_eof()
-                        elapsed = time.monotonic() - proxy_start
-                        log.info("[%s] Streaming response complete for %s in %.1fs",
-                                 request.remote, instance.alias, elapsed)
-                    asyncio.create_task(self._maybe_save_kv_cache(instance))
-                    return resp
-            else:
-                if keepalive_task:
-                    keepalive_task.cancel()
-                async with self._session.request(
-                    request.method, target_url, headers=headers, data=body, timeout=timeout
-                ) as upstream:
-                    resp_body = await upstream.read()
-                    instance.last_activity = time.monotonic()
-                    elapsed = time.monotonic() - proxy_start
-                    log.info("[%s] Response complete for %s in %.1fs (%d bytes)",
-                             request.remote, instance.alias, elapsed, len(resp_body))
-                    asyncio.create_task(self._maybe_save_kv_cache(instance))
-                    return web.Response(
-                        status=upstream.status,
-                        headers={k: v for k, v in upstream.headers.items() if k.lower() not in ("transfer-encoding", "content-length")},
-                        body=resp_body,
-                    )
-        finally:
-            if keepalive_task:
-                keepalive_task.cancel()
-            instance.active_requests -= 1
-            instance.last_activity = time.monotonic()
-
-    # --- HTTP Handlers ---
 
     async def handle_models(self, request: web.Request) -> web.Response:
         models = self._scan_models()
@@ -1325,119 +805,11 @@ class Orchestrator:
             "idle_timeout": self.idle_timeout,
         })
 
-    async def handle_load(self, request: web.Request) -> web.Response:
-        body = await request.json()
-        model_name = body.get("model")
-        if not model_name:
-            return web.json_response({"error": "missing 'model' field"}, status=400)
-        result = self._resolve_model(model_name)
-        if result is None:
-            return web.json_response({"error": f"model '{model_name}' not found"}, status=404)
-        alias, path = result
-        instance = await self._load_model(alias, path)
-        return web.json_response({"status": "loaded", "alias": alias, "port": instance.port})
-
-    async def handle_unload(self, request: web.Request) -> web.Response:
-        body = await request.json()
-        model_name = body.get("model")
-        if not model_name:
-            return web.json_response({"error": "missing 'model' field"}, status=400)
-        result = self._resolve_model(model_name)
-        if result is None:
-            return web.json_response({"error": f"model '{model_name}' not found"}, status=404)
-        alias, _ = result
-        if alias not in self.instances:
-            return web.json_response({"error": f"model '{alias}' is not loaded"}, status=400)
-        await self._unload_model(alias)
-        return web.json_response({"status": "unloaded", "alias": alias})
-
-    async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
-        body = await request.read()
-        model_name = self._extract_model_name(request, body)
-        if not model_name:
-            return web.json_response(
-                {"error": {"message": "No 'model' field in request and no default model configured. "
-                                      "Set 'default_model' in config or pass ?model=name",
-                           "type": "invalid_request_error"}},
-                status=400,
-            )
-
-        result = self._resolve_model(model_name)
-        if result is None:
-            return web.json_response(
-                {"error": {"message": f"Model '{model_name}' not found in {self.model_dir}", "type": "model_not_found"}},
-                status=404,
-            )
-
-        alias, path = result
-        client = request.remote
-        log.info("[%s] %s %s model=%s", client, request.method, request.path, alias)
-
-        is_stream = False
-        if body:
-            try:
-                is_stream = json.loads(body).get("stream", False)
-            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
-                pass
-
-        resp = None
-        keepalive_task = None
-        if is_stream:
-            resp = web.StreamResponse(
-                status=200,
-                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
-            )
-            try:
-                await resp.prepare(request)
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, Exception) as e:
-                if "closing transport" in str(e).lower() or "reset" in str(e).lower():
-                    log.info("[%s] Client disconnected before model load for %s", client, alias)
-                    return resp
-                raise
-            keepalive_task = asyncio.create_task(self._keepalive_loop(resp))
-
-        try:
-            instance = await self._load_model(alias, path)
-        except Exception:
-            if keepalive_task:
-                keepalive_task.cancel()
-            if resp is not None:
-                err = json.dumps({"error": {"message": f"Failed to load model '{alias}'", "type": "server_error"}})
-                try:
-                    await resp.write(f"data: {err}\n\n".encode())
-                    await resp.write_eof()
-                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                    pass
-                return resp
-            raise
-
-        if keepalive_task:
-            keepalive_task.cancel()
-        prompt_eval_task = None
-        if is_stream and resp is not None:
-            prompt_chars = 0
-            if body:
-                try:
-                    msgs = json.loads(body).get("messages", [])
-                    for m in msgs:
-                        c = m.get("content", "")
-                        prompt_chars += len(c) if isinstance(c, str) else sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
-                except Exception:
-                    pass
-            est_tokens = max(prompt_chars // 4, 0)
-            prompt_eval_task = asyncio.create_task(
-                self._prompt_eval_loop(resp, instance, est_tokens)
-            )
-
-        return await self._proxy_request(request, instance, resp, prompt_eval_task)
-
-    async def handle_health(self, request: web.Request) -> web.Response:
-        return web.json_response({"status": "ok"})
-
     # --- Lifecycle ---
 
     async def _on_startup(self, app: web.Application):
         self._session = aiohttp.ClientSession()
+        self._kv = KVCacheManager(self._session, self.kv_cache_dir)
         self._reaper_task = asyncio.create_task(self._reaper_loop())
         self._gpu_monitor_task = asyncio.create_task(self._gpu_monitor_loop())
         self._slot_monitor_task = asyncio.create_task(self._slot_monitor_loop())
@@ -1460,30 +832,7 @@ class Orchestrator:
         app = web.Application()
         app.on_startup.append(self._on_startup)
         app.on_shutdown.append(self._on_shutdown)
-
-        # Management API
-        app.router.add_get("/health", self.handle_health)
-        app.router.add_get("/v1/models", self.handle_models)
-        app.router.add_get("/orchestrator/status", self.handle_status)
-
-        app.router.add_post("/orchestrator/load", self.handle_load)
-        app.router.add_post("/orchestrator/unload", self.handle_unload)
-
-        # OpenAI-compatible proxy routes
-        app.router.add_route("*", "/v1/{path:.*}", self.handle_proxy)
-
-        # llama.cpp native routes
-        app.router.add_route("*", "/completion", self.handle_proxy)
-        app.router.add_route("*", "/chat/completions", self.handle_proxy)
-        app.router.add_route("*", "/responses", self.handle_proxy)
-        app.router.add_route("*", "/embedding", self.handle_proxy)
-        app.router.add_route("*", "/models", self.handle_models)
-        app.router.add_route("*", "/tokenize", self.handle_proxy)
-        app.router.add_route("*", "/detokenize", self.handle_proxy)
-        app.router.add_route("*", "/props", self.handle_proxy)
-        app.router.add_route("*", "/slots", self.handle_proxy)
-        app.router.add_route("*", r"/slots/{slot_id:\d+}", self.handle_proxy)
-
+        setup_routes(app, self)
         return app
 
     def run(self):
@@ -1585,381 +934,7 @@ def _ensure_config(config_path: str) -> bool:
     return True
 
 
-class ModelAnalyzer:
-    """Shared heuristic engine for --info, --autoconf, and --register."""
-
-    CTX_TIERS = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-
-    def __init__(self, config_path: str):
-        with open(config_path) as f:
-            self.cfg = yaml.safe_load(f)
-        self.defaults = self.cfg.get("defaults", {})
-        gpu_cfg = self.cfg.get("gpu", {})
-        self.overhead_mb = gpu_cfg.get("overhead_mb", 1024)
-        self.safety_mb = gpu_cfg.get("safety_margin_mb", 512)
-        detected = _detect_gpu_memory_mb()
-        self.gpu_total_mb = gpu_cfg.get("total_mb") or detected or 0
-        self.available_mb = max(0, self.gpu_total_mb - self.overhead_mb - self.safety_mb)
-        self.system_ram_mb = _detect_system_ram_mb() or 0
-
-    def analyze(self, model_path: Path, max_ctx_override: int | None = None) -> dict:
-        info = _read_gguf_info(model_path)
-        if info is None:
-            print(f"Error: cannot read GGUF metadata from {model_path}")
-            sys.exit(1)
-
-        size_mb = model_path.stat().st_size / (1024 ** 2)
-        ctk = self.defaults.get("cache_type_k", "f16")
-        ctv = self.defaults.get("cache_type_v", "f16")
-        native_ctx = info.context_length or 262144
-        max_model_ctx = min(max_ctx_override, native_ctx) if max_ctx_override else native_ctx
-        per_layer_mb = size_mb / info.block_count if info.block_count else 0
-        kv_per_token_mb = info.kv_cache_mb(1, ctk, ctv)
-
-        full_offload = size_mb <= self.available_mb
-
-        if full_offload:
-            ngl = -1
-            gpu_layers = info.block_count
-            free_for_kv_vram = self.available_mb - size_mb
-            max_ctx_vram = min(int(free_for_kv_vram / kv_per_token_mb), max_model_ctx) if kv_per_token_mb > 0 else max_model_ctx
-            max_ctx_ram = max_model_ctx
-        else:
-            gpu_layers = int(self.available_mb / per_layer_mb) if per_layer_mb > 0 else 0
-            gpu_layers = min(gpu_layers, info.block_count)
-            ngl = gpu_layers
-            max_ctx_vram = 0
-            max_ctx_ram = max_model_ctx
-
-        tiers = []
-        for ctx in self.CTX_TIERS:
-            if ctx > max_model_ctx:
-                break
-            kv_mb = info.kv_cache_mb(ctx, ctk, ctv)
-            if full_offload:
-                total_vram = size_mb + kv_mb
-                fits_vram = total_vram <= self.available_mb
-                headroom = self.available_mb - total_vram if fits_vram else 0
-                kv_loc = "vram" if fits_vram else "ram"
-            else:
-                gpu_weight_mb = gpu_layers * per_layer_mb
-                kv_loc = "ram"
-                fits_vram = False
-                headroom = self.available_mb - gpu_weight_mb
-            tiers.append({
-                "ctx": ctx,
-                "kv_mb": round(kv_mb),
-                "kv_location": kv_loc,
-                "fits_vram": fits_vram,
-                "headroom_mb": round(headroom) if fits_vram else None,
-            })
-
-        recommended_ctx = max_ctx_vram if full_offload and max_ctx_vram >= 8192 else max_ctx_ram
-        recommended_ctx = min(recommended_ctx, max_model_ctx)
-        recommended_nglkv = None
-        if not full_offload:
-            recommended_kv_loc = "ram"
-            if self.system_ram_mb > 0:
-                ram_overhead_mb = 2048
-                cpu_layers = info.block_count - ngl
-                cpu_weights_mb = cpu_layers * (size_mb / info.block_count)
-                ram_for_kv = self.system_ram_mb - ram_overhead_mb - cpu_weights_mb
-                if ram_for_kv > 0:
-                    kv_per_token = info.kv_cache_mb(1, ctk, ctv)
-                    if kv_per_token > 0:
-                        max_ctx_ram_budget = int(ram_for_kv / kv_per_token)
-                        recommended_ctx = min(recommended_ctx, max_ctx_ram_budget, max_model_ctx)
-        else:
-            kv_at_max = info.kv_cache_mb(max_model_ctx, ctk, ctv)
-            if size_mb + kv_at_max <= self.available_mb:
-                recommended_ctx = max_model_ctx
-                recommended_kv_loc = "vram"
-            elif max_ctx_vram < max_model_ctx and max_model_ctx > max_ctx_vram * 1.2:
-                recommended_kv_loc = "ram"
-                recommended_ctx = max_model_ctx
-            else:
-                recommended_kv_loc = "vram"
-
-        if recommended_kv_loc == "ram" and full_offload and info.block_count:
-            free_after = self.available_mb - size_mb
-            kv_total = info.kv_cache_mb(recommended_ctx, ctk, ctv)
-            kv_per_layer = kv_total / info.block_count if info.block_count > 0 else 0
-            if kv_per_layer > 0 and free_after > kv_per_layer:
-                recommended_nglkv = min(int(free_after / kv_per_layer), info.block_count)
-            else:
-                recommended_nglkv = 0
-
-        return {
-            "path": str(model_path),
-            "stem": model_path.stem,
-            "size_mb": round(size_mb),
-            "size_gb": round(size_mb / 1024, 2),
-            "layers": info.block_count,
-            "max_context": max_model_ctx,
-            "embedding_length": info.embedding_length,
-            "head_count": info.head_count,
-            "head_count_kv": info.head_count_kv,
-            "head_dim": info.head_dim,
-            "cache_type_k": ctk,
-            "cache_type_v": ctv,
-            "gpu_total_mb": round(self.gpu_total_mb),
-            "gpu_available_mb": round(self.available_mb),
-            "full_offload": full_offload,
-            "gpu_layers": gpu_layers,
-            "ngl": ngl,
-            "max_ctx_vram": max_ctx_vram,
-            "max_ctx_ram": max_ctx_ram,
-            "tiers": tiers,
-            "recommended": {
-                "ctx_size": recommended_ctx,
-                "ngl": ngl,
-                "kv_location": recommended_kv_loc,
-                "n_gpu_layers_kv": recommended_nglkv,
-            },
-        }
-
-    def print_all(self):
-        scan_dir = Path(self.cfg.get("model_dir", "/path/to/models"))
-        models = sorted(
-            [p for p in scan_dir.rglob("*.gguf") if not p.name.startswith("mmproj")],
-            key=lambda p: p.stat().st_size,
-        )
-        if not models:
-            print(f"No .gguf models found in {scan_dir}")
-            return
-
-        ctk = self.defaults.get("cache_type_k", "f16")
-        ctv = self.defaults.get("cache_type_v", "f16")
-
-        print(f"\nGPU: {self.gpu_total_mb} MB total, {round(self.available_mb)} MB available "
-              f"(overhead {self.overhead_mb} + safety {self.safety_mb} MB reserved)")
-        print(f"KV quant: K={ctk}  V={ctv}\n")
-
-        hdr = (f"{'Model':<55} {'Size':>6} {'Layers':>7} {'Offload':>10} "
-               f"{'Ctx(VRAM)':>10} {'Ctx(RAM)':>10} {'Recommended':>12}")
-        print(hdr)
-        print("-" * len(hdr))
-
-        for p in models:
-            a = self.analyze(p)
-            r = a["recommended"]
-            offload = "full" if a["full_offload"] else f"{a['gpu_layers']}/{a['layers']}"
-            ctx_vram = f"{a['max_ctx_vram'] // 1024}K" if a["max_ctx_vram"] > 0 else "-"
-            ctx_ram = f"{a['max_ctx_ram'] // 1024}K"
-            rec_ctx = f"{r['ctx_size'] // 1024}K"
-            kv_hint = f" ({r['kv_location']})" if r["kv_location"] != "auto" else ""
-            print(f"{p.stem:<55} {a['size_gb']:>5.1f}G {a['layers']:>4}L   {offload:>10} "
-                  f"{ctx_vram:>10} {ctx_ram:>10} {rec_ctx + kv_hint:>12}")
-        print()
-
-    def print_info(self, model_path: Path, max_ctx_override: int | None = None):
-        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
-        ctk, ctv = a["cache_type_k"], a["cache_type_v"]
-
-        print(f"\n{'=' * 72}")
-        print(f"  Model:   {model_path.name}")
-        print(f"  Path:    {a['path']}")
-        print(f"  Size:    {a['size_gb']} GB ({a['size_mb']} MB)")
-        print(f"{'=' * 72}")
-        print(f"  Layers:          {a['layers']}")
-        print(f"  Max context:     {a['max_context']:,} tokens")
-        print(f"  Embedding:       {a['embedding_length']}")
-        print(f"  Heads (Q/KV):    {a['head_count']}/{a['head_count_kv']}  (dim {a['head_dim']})")
-        print(f"  KV quant:        K={ctk}  V={ctv}")
-
-        print(f"\n  GPU:             {a['gpu_total_mb']} MB total, {a['gpu_available_mb']} MB available")
-        print(f"                   (overhead {self.overhead_mb} MB + safety {self.safety_mb} MB reserved)")
-        if a["full_offload"]:
-            print(f"  Offload:         FULL ({a['layers']}/{a['layers']} layers on GPU)")
-            print(f"  Max ctx (VRAM):  {a['max_ctx_vram']:,} tokens")
-        else:
-            print(f"  Offload:         PARTIAL ({a['gpu_layers']}/{a['layers']} layers on GPU)")
-            print(f"                   KV cache must live in system RAM")
-        print(f"  Max ctx (RAM):   {a['max_ctx_ram']:,} tokens")
-
-        print(f"\n  Context tiers (KV cache {ctk}/{ctv}):")
-        print(f"  {'Ctx':>9}  {'KV cache':>9}  {'KV loc':>7}  {'VRAM fit':>9}  {'Headroom':>9}")
-        print(f"  {'-' * 50}")
-        for t in a["tiers"]:
-            ctx_s = f"{t['ctx'] // 1024}K"
-            fit_s = "yes" if t["fits_vram"] else "no"
-            hr_s = f"{t['headroom_mb']} MB" if t["headroom_mb"] is not None else "-"
-            print(f"  {ctx_s:>9}  {t['kv_mb']:>7} MB  {t['kv_location']:>7}  {fit_s:>9}  {hr_s:>9}")
-
-        r = a["recommended"]
-        print(f"\n  Recommended config:")
-        print(f"    ctx_size:     {r['ctx_size']:,}")
-        print(f"    ngl:          {r['ngl']}")
-        print(f"    kv_location:  {r['kv_location']}")
-        if r.get('n_gpu_layers_kv') is not None:
-            print(f"    n_gpu_layers_kv: {r['n_gpu_layers_kv']}")
-        print()
-
-    def generate_overrides(self, analysis: dict) -> dict:
-        r = analysis["recommended"]
-        overrides = {}
-        if r["ctx_size"] != 0:
-            overrides["ctx_size"] = r["ctx_size"]
-        if r["ngl"] != -1:
-            overrides["ngl"] = r["ngl"]
-        overrides["kv_location"] = r["kv_location"]
-        if r.get("n_gpu_layers_kv") is not None:
-            overrides["n_gpu_layers_kv"] = r["n_gpu_layers_kv"]
-        return overrides
-
-    @staticmethod
-    def _update_model_overrides(config_path: str, stem: str, overrides: dict):
-        """Append or update model_overrides in config without destroying comments.
-
-        Uses a two-pass approach: parse with PyYAML for correctness, then
-        splice into the raw lines to preserve comments and formatting.
-        """
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
-
-        if cfg is None:
-            cfg = {}
-
-        mo = cfg.get("model_overrides")
-        if mo is None or not isinstance(mo, dict):
-            mo = {}
-        mo[stem] = overrides
-        cfg["model_overrides"] = mo
-
-        with open(config_path) as f:
-            lines = f.readlines()
-
-        override_yaml = yaml.dump(
-            {stem: overrides}, default_flow_style=False, sort_keys=False,
-        ).rstrip("\n")
-        override_block = "\n".join("  " + ln for ln in override_yaml.split("\n")) + "\n"
-
-        mo_idx = None
-        mo_commented = False
-        for i, line in enumerate(lines):
-            stripped = line.lstrip()
-            if stripped.startswith("# model_overrides:"):
-                mo_idx = i
-                mo_commented = True
-                break
-            if stripped.startswith("model_overrides:"):
-                mo_idx = i
-                mo_commented = False
-                break
-
-        if mo_idx is None:
-            lines.append("\nmodel_overrides:\n")
-            lines.append(override_block)
-        elif mo_commented:
-            lines[mo_idx] = "model_overrides:\n"
-            lines.insert(mo_idx + 1, override_block)
-        else:
-            mo_line = lines[mo_idx].rstrip()
-            if mo_line != "model_overrides:":
-                lines[mo_idx] = "model_overrides:\n"
-
-            stem_q = f'  "{stem}":'
-            stem_nq = f"  {stem}:"
-            entry_start = None
-            entry_end = None
-            for i in range(mo_idx + 1, len(lines)):
-                s = lines[i].rstrip()
-                if s == stem_q or s == stem_nq:
-                    entry_start = i
-                    entry_end = i + 1
-                    while entry_end < len(lines):
-                        next_line = lines[entry_end]
-                        if next_line.strip() == "" or (not next_line.startswith("    ") and next_line.strip()):
-                            break
-                        entry_end += 1
-                    break
-                if s and not s.startswith(" ") and not s.startswith("#"):
-                    break
-
-            if entry_start is not None:
-                lines[entry_start:entry_end] = [override_block]
-            else:
-                lines.insert(mo_idx + 1, override_block)
-
-        with open(config_path, "w") as f:
-            f.writelines(lines)
-
-        yaml.safe_load(open(config_path))  # validate
-
-    def autoconf(self, model_path: Path, config_path: str, max_ctx_override: int | None = None):
-        stem = model_path.stem
-        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
-        overrides = self.generate_overrides(a)
-
-        if overrides:
-            self._update_model_overrides(config_path, stem, overrides)
-
-        print(f"Model: {model_path.name}")
-        if overrides:
-            print(f"Added overrides for '{stem}':")
-            for k, v in overrides.items():
-                print(f"  {k}: {v}")
-        else:
-            print(f"No overrides needed for '{stem}' — defaults are optimal")
-        print(f"\n  Full offload:  {a['full_offload']}")
-        print(f"  GPU layers:    {a['gpu_layers']}/{a['layers']}")
-        print(f"  Context:       {a['recommended']['ctx_size']:,}")
-        print(f"  KV location:   {a['recommended']['kv_location']}")
-        nglkv = a['recommended'].get('n_gpu_layers_kv')
-        if nglkv is not None:
-            print(f"  KV GPU layers: {nglkv}/{a['layers']}")
-        if overrides:
-            print(f"\nConfig updated: {config_path}")
-
-    def register(self, model_path: Path, config_path: str, max_ctx_override: int | None = None):
-        model_path = model_path.resolve()
-        if not model_path.exists():
-            print(f"Error: file not found: {model_path}")
-            sys.exit(1)
-        if model_path.suffix != ".gguf":
-            print(f"Error: not a .gguf file: {model_path}")
-            sys.exit(1)
-
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
-
-        model_dir = Path(cfg.get("model_dir", "/path/to/models")).resolve()
-        if not str(model_path).startswith(str(model_dir)):
-            print(f"Warning: {model_path} is outside model_dir ({model_dir})")
-            print(f"The orchestrator scans model_dir recursively — the model must be inside it to be discovered.")
-            print(f"Consider moving/symlinking it to: {model_dir}/")
-
-        stem = model_path.stem
-        if stem in (cfg.get("model_overrides") or {}):
-            print(f"Model '{stem}' already registered in config. Updating overrides.")
-
-        a = self.analyze(model_path, max_ctx_override=max_ctx_override)
-        overrides = self.generate_overrides(a)
-
-        if overrides:
-            self._update_model_overrides(config_path, stem, overrides)
-
-        print(f"\nRegistered: {model_path.name}")
-        print(f"  Path:          {model_path}")
-        print(f"  Size:          {a['size_gb']} GB")
-        print(f"  Layers:        {a['layers']}")
-        print(f"  Max context:   {a['max_context']:,}")
-        print(f"  Full offload:  {a['full_offload']}")
-        print(f"  GPU layers:    {a['gpu_layers']}/{a['layers']}")
-        print(f"  Context:       {a['recommended']['ctx_size']:,}")
-        print(f"  KV location:   {a['recommended']['kv_location']}")
-        nglkv = a['recommended'].get('n_gpu_layers_kv')
-        if nglkv is not None:
-            print(f"  KV GPU layers: {nglkv}/{a['layers']}")
-        if overrides:
-            print(f"\n  Overrides written:")
-            for k, v in overrides.items():
-                print(f"    {k}: {v}")
-        else:
-            print(f"\n  No overrides needed — defaults are optimal")
-        print(f"\nConfig updated: {config_path}")
-
-
+# ModelAnalyzer is in analyzer.py
 def main():
     import argparse
 
@@ -1988,6 +963,8 @@ examples:
     group.add_argument("--register", metavar="MODEL", help="register a new model and write config overrides")
     parser.add_argument("--ctx", type=int, metavar="N",
                         help="target context size (overrides auto-detection from GGUF metadata)")
+    parser.add_argument("--gpu-priority", action="store_true",
+                        help="cap context to fit all KV cache on GPU (no RAM spillover)")
 
     args = parser.parse_args()
 
@@ -2018,12 +995,13 @@ examples:
                 sys.exit(1)
             print(f"Resolved: {model_arg} -> {model_path}")
 
+        gpu_prio = args.gpu_priority
         if args.info:
-            analyzer.print_info(model_path, max_ctx_override=args.ctx)
+            analyzer.print_info(model_path, max_ctx_override=args.ctx, gpu_priority=gpu_prio)
         elif args.autoconf:
-            analyzer.autoconf(model_path, args.config, max_ctx_override=args.ctx)
+            analyzer.autoconf(model_path, args.config, max_ctx_override=args.ctx, gpu_priority=gpu_prio)
         elif args.register:
-            analyzer.register(model_path, args.config, max_ctx_override=args.ctx)
+            analyzer.register(model_path, args.config, max_ctx_override=args.ctx, gpu_priority=gpu_prio)
         return
 
     orchestrator = Orchestrator(args.config)
