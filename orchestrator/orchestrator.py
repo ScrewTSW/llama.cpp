@@ -369,6 +369,19 @@ class Orchestrator:
         chat_template_file = cfg.get("chat_template_file")
         if chat_template_file:
             cmd.extend(["--chat-template-file", str(chat_template_file)])
+        # Speculative decoding / multi-token prediction. Models with an MTP head
+        # (nextn tensors) need --spec-type draft-mtp or the head is discarded as
+        # an unused tensor and output quality collapses.
+        spec_type = cfg.get("spec_type")
+        if spec_type:
+            cmd.extend(["--spec-type", str(spec_type)])
+        spec_draft_n_max = cfg.get("spec_draft_n_max")
+        if spec_draft_n_max is not None:
+            cmd.extend(["--spec-draft-n-max", str(spec_draft_n_max)])
+        split_mode = cfg.get("split_mode")
+        if split_mode:
+            cmd.extend(["--split-mode", str(split_mode)])
+
         # Sampler defaults; per-request values from the client still override these.
         for key, flag in (("temp", "--temp"), ("top_p", "--top-p"),
                           ("top_k", "--top-k"), ("min_p", "--min-p")):

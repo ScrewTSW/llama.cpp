@@ -242,6 +242,21 @@ async def proxy_request(orchestrator, request: web.Request, instance: ModelInsta
                     modified = True
                     log.info("[%s] Injected max_tokens=%d for %s", request.remote, data["max_tokens"], instance.alias)
 
+                # Reasoning models spend most of their budget inside <think> before
+                # emitting any content - Qwen3.8 needs ~230 tokens just to answer
+                # "hello". A client sending a small max_tokens (Continue defaults to
+                # a few hundred) gets an empty reply because generation stops mid
+                # thought. Raise any client value up to the configured floor.
+                min_max = orchestrator._get_model_config(instance.alias).get("min_max_tokens")
+                if min_max:
+                    for key in ("max_tokens", "max_completion_tokens"):
+                        cur = data.get(key)
+                        if isinstance(cur, int) and cur < min_max:
+                            data[key] = int(min_max)
+                            modified = True
+                            log.info("[%s] Raised %s %d -> %d for %s (reasoning floor)",
+                                     request.remote, key, cur, data[key], instance.alias)
+
         except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
             pass
 
