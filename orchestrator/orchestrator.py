@@ -41,6 +41,7 @@ class Orchestrator:
         self.model_dir = Path(self.cfg["model_dir"])
         self.llama_bin = self.cfg["llama_server_bin"]
         self.idle_timeout = self.cfg.get("idle_timeout", 300)
+        self.health_timeout = self.cfg.get("health_timeout", 300)
         self.max_loaded = self.cfg.get("max_loaded_models", 2)
         self.internal_port_start = self.cfg.get("internal_port_start", 58120)
         self.internal_port_end = self.cfg.get("internal_port_end", 58199)
@@ -341,14 +342,39 @@ class Orchestrator:
             if cache_reuse:
                 cmd.extend(["--cache-reuse", str(cache_reuse)])
         if cfg.get("context_shift", False):
-            cmd.append("--context-shift")
+            if is_hybrid:
+                log.info("Model %s is hybrid (SSM/attention) — skipping --context-shift "
+                         "(recurrent state cannot be shifted)", instance.alias)
+            else:
+                cmd.append("--context-shift")
         if cfg.get("embeddings", False):
             cmd.append("--embeddings")
         reasoning_format = cfg.get("reasoning_format")
         if reasoning_format:
             cmd.extend(["--reasoning-format", reasoning_format])
+        reasoning = cfg.get("reasoning")
+        if reasoning is not None:
+            cmd.extend(["--reasoning", str(reasoning)])
+        reasoning_budget = cfg.get("reasoning_budget")
+        if reasoning_budget is not None:
+            cmd.extend(["--reasoning-budget", str(reasoning_budget)])
+        reasoning_budget_message = cfg.get("reasoning_budget_message")
+        if reasoning_budget_message is not None:
+            cmd.extend(["--reasoning-budget-message", str(reasoning_budget_message)])
+        chat_template_kwargs = cfg.get("chat_template_kwargs")
+        if chat_template_kwargs:
+            cmd.extend(["--chat-template-kwargs", json.dumps(chat_template_kwargs)])
         if cfg.get("jinja", False):
             cmd.append("--jinja")
+        chat_template_file = cfg.get("chat_template_file")
+        if chat_template_file:
+            cmd.extend(["--chat-template-file", str(chat_template_file)])
+        # Sampler defaults; per-request values from the client still override these.
+        for key, flag in (("temp", "--temp"), ("top_p", "--top-p"),
+                          ("top_k", "--top-k"), ("min_p", "--min-p")):
+            val = cfg.get(key)
+            if val is not None:
+                cmd.extend([flag, str(val)])
         repeat_penalty = cfg.get("repeat_penalty")
         if repeat_penalty is not None:
             cmd.extend(["--repeat-penalty", str(repeat_penalty)])
@@ -374,7 +400,14 @@ class Orchestrator:
         instance.is_hybrid = is_hybrid
         return cmd
 
-    async def _wait_for_health(self, instance: ModelInstance, timeout: float = 120) -> bool:
+    async def _wait_for_health(self, instance: ModelInstance, timeout: float | None = None) -> bool:
+        # Cold loads read the whole GGUF from disk; a 12 GB model on a cold page
+        # cache can exceed two minutes. Per-model override wins, then the global
+        # setting, then the default.
+        if timeout is None:
+            timeout = self._get_model_config(instance.alias).get(
+                "health_timeout", self.health_timeout
+            )
         url = f"{instance.base_url}/health"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -790,14 +823,24 @@ class Orchestrator:
     async def handle_status(self, request: web.Request) -> web.Response:
         loaded = []
         for alias, inst in self.instances.items():
+            model_timeout = self._get_model_config(alias).get("idle_timeout", self.idle_timeout)
+            idle_seconds = int(time.monotonic() - inst.last_activity)
             loaded.append({
                 "alias": alias,
                 "model": str(inst.model_path),
                 "port": inst.port,
                 "alive": inst.alive,
+                "loading": inst.loading,
                 "pid": inst.process.pid if inst.process else None,
                 "active_requests": inst.active_requests,
-                "idle_seconds": int(time.monotonic() - inst.last_activity),
+                "idle_seconds": idle_seconds,
+                "idle_timeout": model_timeout,
+                "unload_in": max(0, model_timeout - idle_seconds),
+                "ctx_size": inst.ctx_size,
+                "n_slots": inst.n_slots,
+                "is_hybrid": inst.is_hybrid,
+                "last_prompt_tokens": inst.last_prompt_tokens,
+                "last_completion_tokens": inst.last_completion_tokens,
             })
         return web.json_response({
             "loaded_models": loaded,

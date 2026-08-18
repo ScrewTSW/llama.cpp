@@ -521,6 +521,60 @@ def setup_routes(app: web.Application, orchestrator):
 
         return await proxy_request(orchestrator, request, instance, resp, pe_task, est_tokens)
 
+    async def handle_cancel(request):
+        """Cancel in-flight generation.
+
+        Two modes:
+          default        -- release the leaked active_requests counter so the
+                            idle reaper can unload normally. Generation itself
+                            finishes on its own (llama-server has no stop API).
+          {"unload":true}-- hard stop: kill the model process outright.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model_name = body.get("model")
+        force_unload = bool(body.get("unload", False))
+
+        targets = []
+        if model_name:
+            result = orchestrator._resolve_model(model_name)
+            if result is None:
+                return web.json_response({"error": f"model '{model_name}' not found"}, status=404)
+            alias = result[0]
+            if alias in orchestrator.instances:
+                targets.append(alias)
+        elif force_unload:
+            # Explicit hard stop: target everything loaded, busy or not.
+            targets = list(orchestrator.instances)
+        else:
+            targets = [a for a, i in orchestrator.instances.items() if i.active_requests > 0]
+
+        if not targets:
+            return web.json_response({"status": "nothing-to-cancel", "cancelled": []})
+
+        cancelled = []
+        for alias in targets:
+            inst = orchestrator.instances.get(alias)
+            if inst is None:
+                continue
+            # llama-server exposes only save/restore/erase on /slots -- there is
+            # no "stop" action, so in-flight generation cannot be aborted in
+            # place. Clearing the counter unblocks the reaper; unloading (which
+            # kills the process) is the only hard stop.
+            if force_unload:
+                await orchestrator._unload_model(alias)
+                action = "unloaded"
+            else:
+                inst.active_requests = 0
+                inst.last_activity = time.monotonic()
+                action = "released"
+            cancelled.append({"alias": alias, "action": action})
+            log.info("Cancel requested for %s -> %s", alias, action)
+
+        return web.json_response({"status": "cancelled", "cancelled": cancelled})
+
     async def handle_health(request):
         return web.json_response({"status": "ok"})
 
@@ -529,6 +583,7 @@ def setup_routes(app: web.Application, orchestrator):
     app.router.add_get("/orchestrator/status", handle_status)
     app.router.add_post("/orchestrator/load", handle_load)
     app.router.add_post("/orchestrator/unload", handle_unload)
+    app.router.add_post("/orchestrator/cancel", handle_cancel)
 
     app.router.add_route("*", "/v1/{path:.*}", handle_proxy)
     app.router.add_route("*", "/completion", handle_proxy)
