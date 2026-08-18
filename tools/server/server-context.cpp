@@ -3347,7 +3347,23 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // Recurrent/hybrid memory (SSM, Gated DeltaNet) cannot remove an
+                    // arbitrary suffix - it only supports bounded partial removal. How
+                    // much is removable is not knowable from the token list here (the
+                    // memory holds state the slot no longer tracks), so try the removal
+                    // and recover if the memory rejects it. common_memory::seq_rm()
+                    // aborts on failure, so call the raw API for the fallible attempt.
+                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                            SLT_WRN(slot, "memory rejected partial removal from p0 = %d - clearing the sequence and reprocessing the prompt\n", p0);
+
+                            slot.mem.seq_rm(slot.id, -1, -1);
+                            slot.prompt.tokens.clear();
+                        }
+
+                    } else {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
